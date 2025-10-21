@@ -1,3 +1,4 @@
 wordnets
 __pycache__
 examples
+.env

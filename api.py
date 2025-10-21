@@ -7,6 +7,8 @@ from openai import OpenAI
 import os
 import asyncio
 from typing import AsyncGenerator
+from dotenv import load_dotenv
+load_dotenv()
 
 app = FastAPI(title="RuWordNet Taxonomy Prediction API")
 
