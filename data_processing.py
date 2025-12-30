@@ -50,7 +50,7 @@ def extract_context_around_tag(text, tag_content, context_sentences=2):
         current_pos = sentence_end + 1  # +1 для пробела
     
     if tag_sentence_idx == -1:
-        print('Sentence with tag not found')
+        #print('Sentence with tag not found')
         return text
     
     # Определить границы контекста
@@ -74,7 +74,7 @@ def extract_context_around_tag(text, tag_content, context_sentences=2):
     result = ' '.join(result_parts).strip()
     
     # Добавить отладочный вывод
-    print(f"Extracted context ({len(result)} chars): {result[:200]}...")
+    #print(f"Extracted context ({len(result)} chars): {result[:200]}...")
     
     return result
 
@@ -92,7 +92,7 @@ def load_corpus_text(corpus_folder, word):
     file_path = corpus_path / f"{word}.txt"
     
     if not file_path.exists():
-        print(f"File not found: {file_path}")
+        #print(f"File not found: {file_path}")
         return None
     
     try:
@@ -102,11 +102,11 @@ def load_corpus_text(corpus_folder, word):
         # Найти тег <predict_kb>
         tag_match = re.search(r'<predict_kb>(.*?)</predict_kb>', content)
         if not tag_match:
-            print('Tag not found in file content')
+            #print('Tag not found in file content')
             return None
         
         tag_content = tag_match.group(1)
-        print(f"Found tag content: '{tag_content}'")
+        #print(f"Found tag content: '{tag_content}'")
         
         # Сократить текст до контекста вокруг тега
         context_text = extract_context_around_tag(content, tag_content, context_sentences=3)

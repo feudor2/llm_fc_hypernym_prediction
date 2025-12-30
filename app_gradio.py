@@ -131,21 +131,64 @@ def process_dataset_item(dataset_path: str, corpus_folder: str, word: str,
 
 def get_dataset_info(dataset_path: str):
     if not dataset_path or not os.path.exists(dataset_path):
-        return "Датасет не выбран или файл не найден", gr.update(choices=[]), gr.update(maximum=1, value=1)
+        return "Датасет не выбран или файл не найден", gr.update(choices=[], interactive=False), gr.update(maximum=1, value=1)
     
     try:
         dataset = load_dataset(dataset_path)
         words = list(dataset.keys())
         max_samples = len(words)
         info = f"📊 Загружен датасет: {len(words)} слов"
+        
+        # Возвращаем пустые choices для dropdown, но делаем его интерактивным для поиска
         return (
             info, 
-            gr.update(choices=words, value=words[0] if words else None, interactive=True),
+            gr.update(choices=[], interactive=True, allow_custom_value=True),
             gr.update(maximum=max_samples, value=max_samples, interactive=True)
         )
     except Exception as e:
-        return f"❌ Ошибка загрузки датасета: {str(e)}", gr.update(choices=[]), gr.update(maximum=1, value=1)
+        return f"❌ Ошибка загрузки датасета: {str(e)}", gr.update(choices=[], interactive=False), gr.update(maximum=1, value=1)
+
+def search_words_in_dataset(dataset_path: str, search_query: str):
+    """Search for words in dataset that match the query"""
+    if not dataset_path or not search_query:
+        return gr.update(choices=[])
     
+    try:
+        dataset = load_dataset(dataset_path)
+        words = list(dataset.keys())
+        
+        # Поиск слов, содержащих запрос (регистронезависимо)
+        search_query = search_query.upper().strip()
+        matching_words = [word for word in words if search_query in word.upper()]
+        
+        # Ограничиваем результат до 50 слов для производительности
+        matching_words = matching_words[:50]
+        
+        return gr.update(choices=matching_words)
+    except Exception as e:
+        logger.error(f"Ошибка поиска в датасете: {e}")
+        return gr.update(choices=[])
+
+def validate_word_in_dataset(dataset_path: str, word: str):
+    """Validate that the word exists in dataset"""
+    if not dataset_path or not word:
+        return "Выберите слово из датасета"
+    
+    try:
+        dataset = load_dataset(dataset_path)
+        if word in dataset:
+            return f"✅ Слово '{word}' найдено в датасете"
+        else:
+            # Предложить похожие слова
+            words = list(dataset.keys())
+            similar = [w for w in words if word.upper() in w.upper() or w.upper() in word.upper()][:5]
+            if similar:
+                return f"❌ Слово '{word}' не найдено. Возможно вы имели в виду: {', '.join(similar)}"
+            else:
+                return f"❌ Слово '{word}' не найдено в датасете"
+    except Exception as e:
+        return f"❌ Ошибка проверки: {str(e)}"
+
 # Добавить функцию загрузки текста из корпуса:
 def load_word_text_from_corpus(corpus_folder: str, word: str):
     """Load text for specific word from corpus"""
@@ -154,12 +197,12 @@ def load_word_text_from_corpus(corpus_folder: str, word: str):
     
     # Ищем файл СЛОВО.txt
     file_path = os.path.join(corpus_folder, f"{word}.txt")
-    logger.info(f'Ищем файл {file_path}')
+    logger.debug(f'Ищем файл {file_path}')
     
     if os.path.exists(file_path):
         try:
             text = load_corpus_text(corpus_folder, word)
-            logger.info(f'Извлечённый текст {text}')
+            logger.debug(f'Извлечённый текст {text}')
             return text
         except Exception as e:
             return f"❌ Ошибка чтения файла: {str(e)}"
@@ -167,31 +210,40 @@ def load_word_text_from_corpus(corpus_folder: str, word: str):
     return f"❌ Файл {word}.txt не найден в корпусе"
 
 # Добавить функцию батч-обработки:
-def process_dataset_batch(dataset_file, corpus_folder, batch_size, max_iterations, 
+def process_dataset_batch(dataset_file, corpus_folder, max_samples, batch_size, max_iterations, 
                          temperature, top_p, reranking, functions, progress=gr.Progress()):
-    """Process entire dataset in batches"""
+    """Process dataset in batches with max_samples limit"""
     if not dataset_file or not corpus_folder:
         return "❌ Выберите датасет и папку корпуса"
     
     try:
         dataset = load_dataset(dataset_file.name)
-        words = list(dataset.keys())
+        all_words = list(dataset.keys())
+        
+        # Ограничиваем количество слов параметром max_samples
+        words_to_process = all_words[:max_samples]
+        total_words = len(words_to_process)
+        
+        logger.info(f"Обработка {total_words} слов из {len(all_words)} (ограничение: {max_samples})")
         
         results = {}
-        total_words = len(words)
+        processed_count = 0
         
         for i in range(0, total_words, batch_size):
-            batch_words = words[i:i+batch_size]
-            progress((i + len(batch_words))/total_words, f"Обработка слов {i+1}-{i+len(batch_words)} из {total_words}")
+            batch_words = words_to_process[i:i+batch_size]
+            batch_end = min(i + batch_size, total_words)
+            
+            progress((processed_count)/total_words, f"Обработка слов {i+1}-{batch_end} из {total_words}")
             
             # Обрабатываем каждое слово в батче
             for word in batch_words:
-                text = load_word_text_from_corpus(corpus_folder, word)
-                if "❌" in text:
-                    results[word] = {"error": text}
-                    continue
-                
                 try:
+                    text = load_word_text_from_corpus(corpus_folder, word)
+                    if "❌" in text:
+                        results[word] = {"error": text}
+                        processed_count += 1
+                        continue
+                    
                     # Получаем последний результат из генератора
                     stream_results = list(process_text_stream(
                         text, max_iterations, temperature, top_p, reranking, functions
@@ -204,17 +256,23 @@ def process_dataset_batch(dataset_file, corpus_folder, batch_size, max_iteration
                         }
                     else:
                         results[word] = {"error": "Нет результатов"}
+                        
                 except Exception as e:
+                    logger.error(f"Ошибка обработки слова {word}: {e}")
                     results[word] = {"error": str(e)}
+                
+                processed_count += 1
+                progress(processed_count/total_words, f"Обработано {processed_count}/{total_words} слов")
         
         # Сохраняем результаты
-        output_file = f"batch_results_{len(words)}words.json"
+        output_file = f"test_results/batch_results_{total_words}words.json"
         with open(output_file, 'w', encoding='utf-8') as f:
             json.dump(results, f, ensure_ascii=False, indent=2)
         
-        return f"✅ Обработка завершена. Результаты сохранены в {output_file}"
+        return f"✅ Обработка завершена. Обработано {processed_count} слов из {len(all_words)}. Результаты сохранены в {output_file}"
         
     except Exception as e:
+        logger.error(f"Ошибка батч-обработки: {e}")
         return f"❌ Ошибка батч-обработки: {str(e)}"
     
 # Добавить функцию для стартовых узлов:
@@ -290,18 +348,28 @@ with gr.Blocks(title="RuWordNet Taxonomy Prediction Client", theme=gr.themes.Sof
         )
         
         with gr.Row():
-            word_dropdown = gr.Dropdown(
-                label="🎯 Выберите слово",
-                choices=[],
-                interactive=True
-            )
-            num_samples = gr.Slider(
-                minimum=1,
-                maximum=1,  # Будет обновляться динамически
-                value=1,
-                step=1,
-                label="🔢 Максимум примеров (для батч-режима)"
-            )
+            with gr.Column(scale=3):
+                word_dropdown = gr.Dropdown(
+                    label="🎯 Поиск и выбор слова",
+                    choices=[],
+                    interactive=True,
+                    allow_custom_value=True,
+                    info="Начните печатать для поиска слов в датасете"
+                )
+            with gr.Column(scale=1):
+                word_validation = gr.Textbox(
+                    label="✓ Проверка слова",
+                    interactive=False,
+                    lines=2
+                )
+        
+        num_samples = gr.Slider(
+            minimum=1,
+            maximum=1,  # Будет обновляться динамически
+            value=1,
+            step=1,
+            label="🔢 Максимум примеров (для батч-режима)"
+        )
         
         # Текст для выбранного слова
         word_text_display = gr.Textbox(
@@ -554,10 +622,30 @@ with gr.Blocks(title="RuWordNet Taxonomy Prediction Client", theme=gr.themes.Sof
         inputs=[dataset_file, corpus_folder, word_dropdown, max_iterations, temperature, top_p, reranking, functions],
         outputs=[process_output_1, result_output_1]
     )
-    # Батч-обработка
+    word_dropdown.change(
+        fn=lambda dataset_file, query: search_words_in_dataset(dataset_file.name if dataset_file else "", query) if query else gr.update(),
+        inputs=[dataset_file, word_dropdown],
+        outputs=[word_dropdown]
+    )
+    
+    # Валидация выбранного слова
+    word_dropdown.select(
+        fn=lambda dataset_file, word: validate_word_in_dataset(dataset_file.name if dataset_file else "", word),
+        inputs=[dataset_file, word_dropdown],
+        outputs=[word_validation]
+    )
+    
+    # Загрузка текста при валидном выборе слова
+    word_dropdown.select(
+        fn=lambda word, corpus: load_word_text_from_corpus(corpus, word),
+        inputs=[word_dropdown, corpus_folder],
+        outputs=[word_text_display]
+    )
+    
+    # Батч-обработка с учетом max_samples
     batch_run_btn.click(
         fn=process_dataset_batch,
-        inputs=[dataset_file, corpus_folder, batch_size, max_iterations, 
+        inputs=[dataset_file, corpus_folder, num_samples, batch_size, max_iterations, 
                 temperature, top_p, reranking, functions],
         outputs=[batch_results]
     )
