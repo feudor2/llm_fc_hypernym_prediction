@@ -6,11 +6,16 @@ import threading
 from queue import Queue
 import time
 import os
+import glob
 from pathlib import Path
 
 # Импортируем функции для работы с данными
 from data_processing import load_dataset, load_corpus_text
 
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 def process_text_stream(text: str, max_iterations: int, temperature: float, top_p: float, 
                        reranking: bool, functions: list):
@@ -125,17 +130,101 @@ def process_dataset_item(dataset_path: str, corpus_folder: str, word: str,
 
 
 def get_dataset_info(dataset_path: str):
-    """Get information about loaded dataset"""
     if not dataset_path or not os.path.exists(dataset_path):
-        return "Датасет не выбран или файл не найден", [], ""
+        return "Датасет не выбран или файл не найден", gr.update(choices=[]), gr.update(maximum=1, value=1)
     
     try:
         dataset = load_dataset(dataset_path)
         words = list(dataset.keys())
+        max_samples = len(words)
         info = f"📊 Загружен датасет: {len(words)} слов"
-        return info, words, words[0] if words else ""
+        return (
+            info, 
+            gr.update(choices=words, value=words[0] if words else None, interactive=True),
+            gr.update(maximum=max_samples, value=max_samples, interactive=True)
+        )
     except Exception as e:
-        return f"❌ Ошибка загрузки датасета: {str(e)}", [], ""
+        return f"❌ Ошибка загрузки датасета: {str(e)}", gr.update(choices=[]), gr.update(maximum=1, value=1)
+    
+# Добавить функцию загрузки текста из корпуса:
+def load_word_text_from_corpus(corpus_folder: str, word: str):
+    """Load text for specific word from corpus"""
+    if not corpus_folder or not word:
+        return ""
+    
+    # Ищем файл СЛОВО.txt
+    file_path = os.path.join(corpus_folder, f"{word}.txt")
+    logger.info(f'Ищем файл {file_path}')
+    
+    if os.path.exists(file_path):
+        try:
+            text = load_corpus_text(corpus_folder, word)
+            logger.info(f'Извлечённый текст {text}')
+            return text
+        except Exception as e:
+            return f"❌ Ошибка чтения файла: {str(e)}"
+    
+    return f"❌ Файл {word}.txt не найден в корпусе"
+
+# Добавить функцию батч-обработки:
+def process_dataset_batch(dataset_file, corpus_folder, batch_size, max_iterations, 
+                         temperature, top_p, reranking, functions, progress=gr.Progress()):
+    """Process entire dataset in batches"""
+    if not dataset_file or not corpus_folder:
+        return "❌ Выберите датасет и папку корпуса"
+    
+    try:
+        dataset = load_dataset(dataset_file.name)
+        words = list(dataset.keys())
+        
+        results = {}
+        total_words = len(words)
+        
+        for i in range(0, total_words, batch_size):
+            batch_words = words[i:i+batch_size]
+            progress((i + len(batch_words))/total_words, f"Обработка слов {i+1}-{i+len(batch_words)} из {total_words}")
+            
+            # Обрабатываем каждое слово в батче
+            for word in batch_words:
+                text = load_word_text_from_corpus(corpus_folder, word)
+                if "❌" in text:
+                    results[word] = {"error": text}
+                    continue
+                
+                try:
+                    # Получаем последний результат из генератора
+                    stream_results = list(process_text_stream(
+                        text, max_iterations, temperature, top_p, reranking, functions
+                    ))
+                    if stream_results:
+                        final_log, final_result = stream_results[-1]
+                        results[word] = {
+                            "result": final_result,
+                            "log": final_log
+                        }
+                    else:
+                        results[word] = {"error": "Нет результатов"}
+                except Exception as e:
+                    results[word] = {"error": str(e)}
+        
+        # Сохраняем результаты
+        output_file = f"batch_results_{len(words)}words.json"
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(results, f, ensure_ascii=False, indent=2)
+        
+        return f"✅ Обработка завершена. Результаты сохранены в {output_file}"
+        
+    except Exception as e:
+        return f"❌ Ошибка батч-обработки: {str(e)}"
+    
+# Добавить функцию для стартовых узлов:
+def get_start_nodes_info(start_nodes_folder: str):
+    """Get information about start nodes folder"""
+    if not start_nodes_folder or not os.path.exists(start_nodes_folder):
+        return "Папка стартовых узлов не выбрана или не найдена"
+    
+    json_files = glob.glob(os.path.join(start_nodes_folder, "*.json"))
+    return f"📁 Найдено {len(json_files)} файлов стартовых узлов"
 
 
 # Example text
@@ -179,14 +268,21 @@ with gr.Blocks(title="RuWordNet Taxonomy Prediction Client", theme=gr.themes.Sof
             )
             corpus_folder = gr.Textbox(
                 label="📂 Папка с корпусом текстов",
-                placeholder="Выберите папку с текстовыми файлами",
+                value="corpus/private",
                 interactive=True
             )
         
-        # Browse buttons for file explorer access
-        with gr.Row():
-            browse_dataset_btn = gr.Button("🔍 Обзор датасета", size="sm")
-            browse_corpus_btn = gr.Button("🔍 Обзор корпуса", size="sm")
+        # Папка стартовых узлов
+        start_nodes_folder = gr.Textbox(
+            label="📁 Папка стартовых узлов (JSON)",
+            value="examples",
+            interactive=True
+        )
+        
+        start_nodes_info = gr.Textbox(
+            label="ℹ️ Информация о стартовых узлах",
+            interactive=False
+        )
         
         dataset_info = gr.Textbox(
             label="ℹ️ Информация о датасете",
@@ -201,13 +297,38 @@ with gr.Blocks(title="RuWordNet Taxonomy Prediction Client", theme=gr.themes.Sof
             )
             num_samples = gr.Slider(
                 minimum=1,
-                maximum=100,
+                maximum=1,  # Будет обновляться динамически
                 value=1,
                 step=1,
-                label="🔢 Количество примеров"
+                label="🔢 Максимум примеров (для батч-режима)"
             )
         
-        dataset_run_btn = gr.Button("🚀 Обработать выбранное слово", variant="primary", size="lg")
+        # Текст для выбранного слова
+        word_text_display = gr.Textbox(
+            label="📝 Текст для выбранного слова",
+            lines=8,
+            interactive=False
+        )
+        
+        with gr.Row():
+            dataset_run_btn = gr.Button("🚀 Обработать выбранное слово", variant="primary")
+            batch_run_btn = gr.Button("🔄 Батч-обработка датасета", variant="secondary")
+        
+        # Батч-параметры
+        with gr.Accordion("⚙️ Параметры батч-обработки", open=False):
+            batch_size = gr.Slider(
+                minimum=1,
+                maximum=10,
+                value=3,
+                step=1,
+                label="Размер батча"
+            )
+        
+        batch_results = gr.Textbox(
+            label="📊 Результаты батч-обработки",
+            lines=5,
+            interactive=False
+        )
     
     # Parameters section (shared)
     with gr.Accordion("⚙️ Параметры", open=True):
@@ -403,24 +524,44 @@ with gr.Blocks(title="RuWordNet Taxonomy Prediction Client", theme=gr.themes.Sof
                  process_output_2, result_output_2,
                  process_output_3, result_output_3]
     )
-    
+    start_nodes_folder.change(
+        fn=get_start_nodes_info,
+        inputs=[start_nodes_folder],
+        outputs=[start_nodes_info]
+    )
+    # Обновление слайдера максимального количества примеров
+    def safe_get_dataset_info(file):
+        if not file:
+            return "Файл не выбран", gr.update(choices=[]), 1
+        
+        file_path = file.name if hasattr(file, 'name') else str(file)
+        return get_dataset_info(file_path)
+
+    dataset_file.change(
+        fn=safe_get_dataset_info,
+        inputs=[dataset_file],
+        outputs=[dataset_info, word_dropdown, num_samples]
+    )
+    # Автозагрузка текста при выборе слова
+    word_dropdown.change(
+        fn=lambda word, corpus: load_word_text_from_corpus(corpus, word),
+        inputs=[word_dropdown, corpus_folder],
+        outputs=[word_text_display]
+    )
+    # Режим выбранного слова
     dataset_run_btn.click(
-        fn=lambda dataset_file, corpus_folder, word, max_iter, temp, top_p_val, rerank, funcs: 
-            list(process_dataset_item(
-                dataset_file.name if dataset_file else "", 
-                corpus_folder, word, max_iter, temp, top_p_val, rerank, funcs
-            ))[-1] if dataset_file and corpus_folder and word else ("❌ Заполните все поля", ""),
+        fn=process_dataset_item,
         inputs=[dataset_file, corpus_folder, word_dropdown, max_iterations, temperature, top_p, reranking, functions],
         outputs=[process_output_1, result_output_1]
     )
-    
-    # Update dataset info when file is uploaded
-    dataset_file.change(
-        fn=lambda file: get_dataset_info(file.name if file else ""),
-        inputs=[dataset_file],
-        outputs=[dataset_info, word_dropdown, word_dropdown]
+    # Батч-обработка
+    batch_run_btn.click(
+        fn=process_dataset_batch,
+        inputs=[dataset_file, corpus_folder, batch_size, max_iterations, 
+                temperature, top_p, reranking, functions],
+        outputs=[batch_results]
     )
-
+    
 
 if __name__ == "__main__":
     demo.launch(server_name="127.0.0.1", server_port=5003, share=False)
