@@ -26,6 +26,13 @@ def process_text_stream(text: str, max_iterations: int, temperature: float, top_
         yield "❌ Ошибка: Текст должен содержать теги <predict_kb>...</predict_kb>", ""
         return
     
+    # Исправить координацию с tools.py
+    valid_functions = ["get_hyponyms", "get_hypernyms"]
+    functions = [f for f in functions if f in valid_functions]
+    
+    if not functions:
+        functions = ["get_hyponyms"]  # Fallback
+    
     # API URL (hardcoded)
     api_url = "http://localhost:8500"
     
@@ -37,7 +44,7 @@ def process_text_stream(text: str, max_iterations: int, temperature: float, top_
         "temperature": temperature,
         "top_p": top_p,
         "reranking": reranking,
-        "functions": functions
+        "functions": functions  # Теперь правильно передается
     }
     
     process_log = ""
@@ -436,8 +443,8 @@ with gr.Blocks(title="RuWordNet Taxonomy Prediction Client", theme=gr.themes.Sof
                 functions = gr.CheckboxGroup(
                     label="🔧 Функции",
                     choices=[
-                        ("get_hyponyms", "get_hyponyms"),
-                        ("get_hypernyms", "get_hypernyms")
+                        ("Получить гипонимы", "get_hyponyms"),
+                        ("Получить гиперонимы", "get_hypernyms")
                     ],
                     value=["get_hyponyms"]
                 )

@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import asyncio
 import logging
 
@@ -16,7 +17,8 @@ from fastapi.responses import StreamingResponse
 from taxoenrich.core import RuWordNet
 from utils import *
 from io_utils import read_yaml
-from tools import tools
+from tools import tools as available_tools_config
+from reranker import Reranker, RerankerRequest
 
 load_dotenv()
 config = read_yaml('config.yml')
@@ -42,6 +44,7 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+reranker = Reranker(oclient, os.environ['MODEL_NAME'], logger)
 
 
 # Request/Response models
@@ -60,7 +63,7 @@ class PredictionResponse(BaseModel):
     full_conversation: list = None
 
 
-def get_hyponyms(node_id):
+def get_hyponyms(node_id, reranking=False, threshold=3):
     """Tool function for getting hyponyms and formatting as markdown"""
     if node_id == 'null':
         node_id = None
@@ -70,6 +73,38 @@ def get_hyponyms(node_id):
     # Format as clean markdown
     if not results:
         return "Гипонимов не найдено."
+
+    # Если включено переранжирование и есть результаты, применяем его
+    if reranking and results and len(results) > threshold:
+        try:
+            # Извлекаем имена синсетов как кандидатов
+            candidates = tuple(item['name'] for item in results)
+            
+            # Получаем target word из контекста (это нужно передать в функцию)
+            # Пока используем заглушку - в реальности target нужно получать из вызова
+            target_word = "unknown"  # TODO: передавать target из вызывающего кода
+            
+            # Создаем запрос на переранжирование
+            rerank_request = RerankerRequest(
+                target=target_word,
+                candidates=candidates,
+                threshold=threshold/5.0,  # Конвертируем в шкалу 0-1
+                rel='hyponym'
+            )
+            
+            # Применяем переранжирование (синхронно)
+            import asyncio
+            reranked = asyncio.run(reranker(rerank_request))
+            
+            # Фильтруем результаты согласно переранжированию
+            reranked_names = {item['candidate'] for item in reranked}
+            results = [item for item in results if item['name'] in reranked_names]
+            
+            logger.info(f"Реранкинг сократил результаты с {len(candidates)} до {len(results)}")
+            
+        except Exception as e:
+            logger.error(f"Ошибка реранкинга: {e}")
+            # Продолжаем с исходными результатами в случае ошибки
     
     markdown = f"**Найдено гипонимов: {len(results)}**\n"
     
@@ -144,30 +179,45 @@ def get_hypernyms(node_id):
     return markdown
 
 
-system_prompt = read_prompt('system', logger)
+def get_system_prompt(functions: list):
+    """Выбрать подходящий системный промпт в зависимости от функций"""
+    if set(functions) == {"get_hyponyms"}:
+        return read_prompt('system_hyponym', logger)
+    elif set(functions) == {"get_hypernyms"}:
+        return read_prompt('system_hypernym', logger)
+    elif set(functions) == {"get_hyponyms", "get_hypernyms"}:
+        return read_prompt('system', logger)
+    else:
+        # Fallback на обычный системный промпт
+        return read_prompt('system', logger)
+    
 
 available_tools = {
     "get_hyponyms": get_hyponyms,
     "get_hypernyms": get_hypernyms
 }
 
+    
 def process_prediction(text: str, max_iterations: int, temperature: float, top_p: float, 
                       reranking: bool, functions: list):
     """Process prediction without streaming"""
     
-    # Логирование параметров пайплайна
-    logger.info(f"Pipeline parameters - reranking: {reranking}, functions: {functions}")
+    # Выбрать подходящий системный промпт
+    system_prompt = get_system_prompt(functions)
     
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": text},
     ]
     
-    # Фильтруем доступные инструменты согласно параметрам
-    filtered_tools = []
-    for tool in tools:
-        if tool["function"]["name"] in functions:
-            filtered_tools.append(tool)
+    # Получить правильный набор инструментов из tools.py
+    if set(functions) == {"get_hyponyms"}:
+        filtered_tools = available_tools_config['hyponym_only']
+    elif set(functions) == {"get_hypernyms"}:
+        filtered_tools = available_tools_config['hypernym_only'] 
+    else:
+        # Объединить оба набора инструментов
+        filtered_tools = available_tools_config['hyponym_only'] + available_tools_config['hypernym_only']
     
     final_result = None
     iteration_count = 0
@@ -239,6 +289,7 @@ async def process_prediction_stream(text: str, max_iterations: int, temperature:
     
     # Логирование параметров пайплайна
     logger.info(f"Pipeline parameters - reranking: {reranking}, functions: {functions}")
+    system_prompt = get_system_prompt(functions)
     
     messages = [
         {"role": "system", "content": system_prompt},
@@ -246,10 +297,13 @@ async def process_prediction_stream(text: str, max_iterations: int, temperature:
     ]
     
     # Фильтруем доступные инструменты согласно параметрам
-    filtered_tools = []
-    for tool in tools:
-        if tool["function"]["name"] in functions:
-            filtered_tools.append(tool)
+    if set(functions) == {"get_hyponyms"}:
+        filtered_tools = available_tools_config['hyponym_only']
+    elif set(functions) == {"get_hypernyms"}:
+        filtered_tools = available_tools_config['hypernym_only'] 
+    else:
+        # Объединить оба набора инструментов
+        filtered_tools = available_tools_config['hyponym_only'] + available_tools_config['hypernym_only']
     
     for i in range(max_iterations):
         yield f"data: {json.dumps({'type': 'iteration', 'iteration': i + 1}, ensure_ascii=False)}\n\n"
