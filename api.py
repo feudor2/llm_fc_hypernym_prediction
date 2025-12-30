@@ -50,6 +50,9 @@ class PredictionRequest(BaseModel):
     max_iterations: int = 50
     temperature: float = 0.5
     top_p: float = 0.95
+    # Новые параметры пайплайна
+    reranking: bool = False
+    functions: list = ["get_hyponyms"]
 
 class PredictionResponse(BaseModel):
     result: str
@@ -99,18 +102,72 @@ def get_hyponyms(node_id):
     return markdown
 
 
+def get_hypernyms(node_id):
+    """Tool function for getting hypernyms and formatting as markdown"""
+    if node_id == 'null':
+        node_id = None
+    
+    results = wordnet.get_hypernyms(node_id, pos='N')
+
+    # Format as clean markdown
+    if not results:
+        return "Гиперонимов не найдено."
+    
+    markdown = f"**Найдено гиперонимов: {len(results)}**\n"
+    
+    for i, item in enumerate(results, 1):
+        # Header with name and ID
+        markdown += f"### {i}. {item['name']} `{item['id']}`\n"
+        
+        # Definition (if available)
+        if item.get('definition'):
+            markdown += f"**Определение:** {item['definition']}\n"
+        
+        # Words (limit to first 5 for brevity)
+        words = item['words'][:5]
+        words_str = "; ".join(words)
+        if len(item['words']) > 5:
+            words_str += f" *(+{len(item['words']) - 5} ещё)*"
+        markdown += f"**Слова:** {words_str}\n"
+        
+        # Hypernyms (show count and first few names)
+        if item['hypernyms']:
+            hypernyms_preview = "; ".join(item['hypernyms'][:10])
+            if len(item['hypernyms']) > 10:
+                hypernyms_preview += f" *(+{len(item['hypernyms']) - 10} ещё)*"
+            markdown += f"**Гиперонимы ({len(item['hypernyms'])}):** {hypernyms_preview}\n"
+        else:
+            markdown += f"**Гиперонимов:** нет (корневой узел)\n"
+        
+        markdown += "---\n\n"
+    
+    return markdown
+
+
 system_prompt = read_prompt('system', logger)
 
 available_tools = {
-    "get_hyponyms": get_hyponyms
+    "get_hyponyms": get_hyponyms,
+    "get_hypernyms": get_hypernyms
 }
 
-def process_prediction(text: str, max_iterations: int, temperature: float, top_p: float):
+def process_prediction(text: str, max_iterations: int, temperature: float, top_p: float, 
+                      reranking: bool, functions: list):
     """Process prediction without streaming"""
+    
+    # Логирование параметров пайплайна
+    logger.info(f"Pipeline parameters - reranking: {reranking}, functions: {functions}")
+    
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": text},
     ]
+    
+    # Фильтруем доступные инструменты согласно параметрам
+    filtered_tools = []
+    for tool in tools:
+        if tool["function"]["name"] in functions:
+            filtered_tools.append(tool)
     
     final_result = None
     iteration_count = 0
@@ -122,7 +179,7 @@ def process_prediction(text: str, max_iterations: int, temperature: float, top_p
             response_obj = oclient.chat.completions.create(
                 model=os.environ['MODEL_NAME'],
                 messages=messages,
-                tools=tools,
+                tools=filtered_tools,  # Используем фильтрованный список
                 temperature=temperature,
                 top_p=top_p,
                 max_tokens=4000,
@@ -136,6 +193,13 @@ def process_prediction(text: str, max_iterations: int, temperature: float, top_p
         # Check if this is the final response
         if not response_message.tool_calls:
             final_result = response_message.content.strip()
+            
+            # Применение переранжирования если включено
+            if reranking and final_result:
+                logger.info("Applying reranking to final result")
+                # Здесь будет логика переранжирования когда API будет готово
+                # final_result = apply_reranking(final_result)
+            
             break
         
         # Process tool calls
@@ -144,7 +208,7 @@ def process_prediction(text: str, max_iterations: int, temperature: float, top_p
             function_name = tool_call.function.name
             function_to_call = available_tools.get(function_name)
             
-            if not function_to_call:
+            if not function_to_call or function_name not in functions:
                 continue
             
             function_args = json.loads(tool_call.function.arguments)
@@ -169,12 +233,23 @@ def process_prediction(text: str, max_iterations: int, temperature: float, top_p
     }
 
 
-async def process_prediction_stream(text: str, max_iterations: int, temperature: float, top_p: float) -> AsyncGenerator[str, None]:
+async def process_prediction_stream(text: str, max_iterations: int, temperature: float, top_p: float,
+                                   reranking: bool, functions: list) -> AsyncGenerator[str, None]:
     """Process prediction with streaming"""
+    
+    # Логирование параметров пайплайна
+    logger.info(f"Pipeline parameters - reranking: {reranking}, functions: {functions}")
+    
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": text},
     ]
+    
+    # Фильтруем доступные инструменты согласно параметрам
+    filtered_tools = []
+    for tool in tools:
+        if tool["function"]["name"] in functions:
+            filtered_tools.append(tool)
     
     for i in range(max_iterations):
         yield f"data: {json.dumps({'type': 'iteration', 'iteration': i + 1}, ensure_ascii=False)}\n\n"
@@ -183,7 +258,7 @@ async def process_prediction_stream(text: str, max_iterations: int, temperature:
             response_obj = oclient.chat.completions.create(
                 model=os.environ['MODEL_NAME'],
                 messages=messages,
-                tools=tools,
+                tools=filtered_tools,  # Используем фильтрованный список
                 temperature=temperature,
                 top_p=top_p,
                 max_tokens=4000,
@@ -202,7 +277,15 @@ async def process_prediction_stream(text: str, max_iterations: int, temperature:
         
         # Check if this is the final response
         if not response_message.tool_calls:
-            yield f"data: {json.dumps({'type': 'final', 'result': response_message.content.strip()}, ensure_ascii=False)}\n\n"
+            final_result = response_message.content.strip()
+            
+            # Применение переранжирования если включено
+            if reranking and final_result:
+                yield f"data: {json.dumps({'type': 'reranking', 'message': 'Применение переранжирования...'}, ensure_ascii=False)}\n\n"
+                # Здесь будет логика переранжирования когда API будет готово
+                # final_result = apply_reranking(final_result)
+            
+            yield f"data: {json.dumps({'type': 'final', 'result': final_result}, ensure_ascii=False)}\n\n"
             return
         
         # Process tool calls
@@ -211,14 +294,14 @@ async def process_prediction_stream(text: str, max_iterations: int, temperature:
             function_name = tool_call.function.name
             function_to_call = available_tools.get(function_name)
             
-            if not function_to_call:
+            if not function_to_call or function_name not in functions:
                 continue
             
             function_args = json.loads(tool_call.function.arguments)
             
             # Get node name for display
             node_name = 'root'
-            if function_args['node_id'] is not None and function_args['node_id'].lower() != 'none':
+            if function_args.get('node_id') is not None and function_args['node_id'].lower() != 'none':
                 if function_args['node_id'] in wordnet.synsets:
                     node_name = wordnet.synsets[function_args['node_id']].synset_name
             
@@ -256,7 +339,9 @@ async def predict(request: PredictionRequest):
         text=request.text,
         max_iterations=request.max_iterations,
         temperature=request.temperature,
-        top_p=request.top_p
+        top_p=request.top_p,
+        reranking=request.reranking,
+        functions=request.functions
     )
     
     return result
@@ -275,6 +360,7 @@ async def predict_stream(request: PredictionRequest):
     - type: 'tool_call' - Function call made
     - type: 'final' - Final result
     - type: 'error' - Error occurred
+    - type: 'reranking' - Reranking is being applied
     """
     if '<predict_kb>' not in request.text or '</predict_kb>' not in request.text:
         msg = "Text must contain <predict_kb>...</predict_kb> tags"
@@ -286,7 +372,9 @@ async def predict_stream(request: PredictionRequest):
             text=request.text,
             max_iterations=request.max_iterations,
             temperature=request.temperature,
-            top_p=request.top_p
+            top_p=request.top_p,
+            reranking=request.reranking,
+            functions=request.functions
         ),
         media_type="text/event-stream"
     )

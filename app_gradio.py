@@ -5,9 +5,15 @@ from typing import Generator
 import threading
 from queue import Queue
 import time
+import os
+from pathlib import Path
+
+# Импортируем функции для работы с данными
+from data_processing import load_dataset, load_corpus_text
 
 
-def process_text_stream(text: str, max_iterations: int, temperature: float, top_p: float):
+def process_text_stream(text: str, max_iterations: int, temperature: float, top_p: float, 
+                       reranking: bool, functions: list):
     """Process text using the streaming API endpoint"""
     
     # Validate input
@@ -18,13 +24,15 @@ def process_text_stream(text: str, max_iterations: int, temperature: float, top_
     # API URL (hardcoded)
     api_url = "http://localhost:8500"
     
-    # Prepare request
+    # Prepare request with pipeline parameters
     endpoint = f"{api_url.rstrip('/')}/predict/stream"
     payload = {
         "text": text,
         "max_iterations": max_iterations,
         "temperature": temperature,
-        "top_p": top_p
+        "top_p": top_p,
+        "reranking": reranking,
+        "functions": functions
     }
     
     process_log = ""
@@ -96,6 +104,40 @@ def process_text_stream(text: str, max_iterations: int, temperature: float, top_
         yield f"❌ Ошибка: {str(e)}", ""
 
 
+def process_dataset_item(dataset_path: str, corpus_folder: str, word: str, 
+                        max_iterations: int, temperature: float, top_p: float, 
+                        reranking: bool, functions: list):
+    """Process a specific word from dataset using corpus text"""
+    try:
+        # Load corpus text for the word
+        text = load_corpus_text(corpus_folder, word)
+        if not text:
+            yield f"❌ Не найден текст для слова: {word}", ""
+            return
+        
+        # Process using the streaming function
+        for process_log, final_result in process_text_stream(
+            text, max_iterations, temperature, top_p, reranking, functions
+        ):
+            yield process_log, final_result
+    except Exception as e:
+        yield f"❌ Ошибка при обработке слова '{word}': {str(e)}", ""
+
+
+def get_dataset_info(dataset_path: str):
+    """Get information about loaded dataset"""
+    if not dataset_path or not os.path.exists(dataset_path):
+        return "Датасет не выбран или файл не найден", [], ""
+    
+    try:
+        dataset = load_dataset(dataset_path)
+        words = list(dataset.keys())
+        info = f"📊 Загружен датасет: {len(words)} слов"
+        return info, words, words[0] if words else ""
+    except Exception as e:
+        return f"❌ Ошибка загрузки датасета: {str(e)}", [], ""
+
+
 # Example text
 example_text = '''Каждое лето группы энтузиастов испытывают себя и отправляются на поиски снега и льда. Чаще всего их называют альпинисты, и они в любое время года не против пересечь ледник или тропить по снегу до вершины. Храбрые профи даже готовы лезть по скалам со льдом, выбирая запредельно сложные маршруты. Горные туристы тоже с удовольствием гуляют среди вечной мерзлоты на высотах более 4000 метров над уровнем моря. И всем им требуется надёжное сцепление на скользкой поверхности льда.
 
@@ -111,45 +153,105 @@ with gr.Blocks(title="RuWordNet Taxonomy Prediction Client", theme=gr.themes.Sof
     Этот интерфейс обращается к API сервису для анализа текста и определения места понятия в таксономии RuWordNet.
     
     **Инструкция:**
-    1. Введите текст с понятием, отмеченным тегами `<predict_kb>...</predict_kb>`
-    2. Настройте параметры (опционально)
-    3. Нажмите "Запустить анализ"
-    4. Наблюдайте процесс в реальном времени
+    1. Выберите режим работы: "Ручной ввод" или "Датасет"
+    2. Настройте параметры модели и пайплайна
+    3. Введите текст или выберите файлы
+    4. Запустите анализ
     """)
     
-    # Text input
-    text_input = gr.Textbox(
-        label="📝 Входной текст",
-        placeholder="Введите текст с тегами <predict_kb>...</predict_kb>",
-        lines=10,
-        value=example_text
-    )
+    # Mode selection
+    with gr.Tab("🖊️ Ручной ввод"):
+        # Text input
+        text_input = gr.Textbox(
+            label="📝 Входной текст",
+            placeholder="Введите текст с тегами <predict_kb>...</predict_kb>",
+            lines=10,
+            value=example_text
+        )
+        
+        manual_run_btn = gr.Button("🚀 Запустить анализ (3 параллельных запроса)", variant="primary", size="lg")
     
-    # Parameters
-    with gr.Accordion("⚙️ Параметры модели", open=False):
-        max_iterations = gr.Slider(
-            minimum=5,
-            maximum=100,
-            value=50,
-            step=1,
-            label="Максимум итераций"
+    with gr.Tab("📊 Режим датасета"):
+        with gr.Row():
+            dataset_file = gr.File(
+                label="📁 Файл датасета (TSV)",
+                file_types=[".tsv"]
+            )
+            corpus_folder = gr.Textbox(
+                label="📂 Папка с корпусом текстов",
+                placeholder="Выберите папку с текстовыми файлами",
+                interactive=True
+            )
+        
+        # Browse buttons for file explorer access
+        with gr.Row():
+            browse_dataset_btn = gr.Button("🔍 Обзор датасета", size="sm")
+            browse_corpus_btn = gr.Button("🔍 Обзор корпуса", size="sm")
+        
+        dataset_info = gr.Textbox(
+            label="ℹ️ Информация о датасете",
+            interactive=False
         )
-        temperature = gr.Slider(
-            minimum=0.0,
-            maximum=1.0,
-            value=0.5,
-            step=0.1,
-            label="Temperature"
-        )
-        top_p = gr.Slider(
-            minimum=0.0,
-            maximum=1.0,
-            value=0.95,
-            step=0.05,
-            label="Top P"
-        )
+        
+        with gr.Row():
+            word_dropdown = gr.Dropdown(
+                label="🎯 Выберите слово",
+                choices=[],
+                interactive=True
+            )
+            num_samples = gr.Slider(
+                minimum=1,
+                maximum=100,
+                value=1,
+                step=1,
+                label="🔢 Количество примеров"
+            )
+        
+        dataset_run_btn = gr.Button("🚀 Обработать выбранное слово", variant="primary", size="lg")
     
-    run_btn = gr.Button("🚀 Запустить анализ (3 параллельных запроса)", variant="primary", size="lg")
+    # Parameters section (shared)
+    with gr.Accordion("⚙️ Параметры", open=True):
+        with gr.Row():
+            # Model parameters
+            with gr.Column():
+                gr.Markdown("**Параметры модели**")
+                max_iterations = gr.Slider(
+                    minimum=5,
+                    maximum=100,
+                    value=50,
+                    step=1,
+                    label="Максимум итераций"
+                )
+                temperature = gr.Slider(
+                    minimum=0.0,
+                    maximum=1.0,
+                    value=0.5,
+                    step=0.1,
+                    label="Temperature"
+                )
+                top_p = gr.Slider(
+                    minimum=0.0,
+                    maximum=1.0,
+                    value=0.95,
+                    step=0.05,
+                    label="Top P"
+                )
+            
+            # Pipeline parameters
+            with gr.Column():
+                gr.Markdown("**Параметры пайплайна**")
+                reranking = gr.Checkbox(
+                    label="🔄 Переранжирование",
+                    value=False
+                )
+                functions = gr.CheckboxGroup(
+                    label="🔧 Функции",
+                    choices=[
+                        ("get_hyponyms", "get_hyponyms"),
+                        ("get_hypernyms", "get_hypernyms")
+                    ],
+                    value=["get_hyponyms"]
+                )
     
     # 3 parallel outputs
     gr.Markdown("### 📊 Параллельные процессы анализа")
@@ -201,11 +303,11 @@ with gr.Blocks(title="RuWordNet Taxonomy Prediction Client", theme=gr.themes.Sof
     gr.Markdown("### 📝 Примеры")
     gr.Examples(
         examples=[
-            [example_text, 50, 0.5, 0.95],
-            ["Этот <predict_kb>велосипед</predict_kb> был изготовлен в Германии.", 50, 0.5, 0.95],
-            ["Новый <predict_kb>смартфон</predict_kb> имеет отличную камеру.", 50, 0.5, 0.95],
+            [example_text, 50, 0.5, 0.95, False, ["get_hyponyms"]],
+            ["Этот <predict_kb>велосипед</predict_kb> был изготовлен в Германии.", 50, 0.5, 0.95, True, ["get_hyponyms", "get_hypernyms"]],
+            ["Новый <predict_kb>смартфон</predict_kb> имеет отличную камеру.", 50, 0.5, 0.95, False, ["get_hyponyms"]],
         ],
-        inputs=[text_input, max_iterations, temperature, top_p],
+        inputs=[text_input, max_iterations, temperature, top_p, reranking, functions],
         label="Кликните на пример для загрузки"
     )
     
@@ -213,6 +315,10 @@ with gr.Blocks(title="RuWordNet Taxonomy Prediction Client", theme=gr.themes.Sof
     gr.Markdown("""
     ---
     ### ℹ️ Информация
+    
+    **Параметры пайплайна:**
+    - **Переранжирование** - включает дополнительную обработку результатов
+    - **Функции** - выберите доступные функции для модели (get_hyponyms, get_hypernyms)
     
     **Возможные результаты:**
     - `not_found` - понятие не найдено в таксономии
@@ -224,16 +330,18 @@ with gr.Blocks(title="RuWordNet Taxonomy Prediction Client", theme=gr.themes.Sof
     """)
     
     # Function to run 3 parallel processes using threads
-    def run_parallel_analysis(text, max_iterations, temperature, top_p):
+    def run_parallel_analysis(text, max_iterations, temperature, top_p, reranking, functions):
         """Run 3 parallel analysis processes using threads"""
         
         # Queues to communicate between threads
         queues = [Queue(), Queue(), Queue()]
         
-        def run_stream(queue_idx, text, max_iterations, temperature, top_p):
+        def run_stream(queue_idx, text, max_iterations, temperature, top_p, reranking, functions):
             """Run streaming in a thread and put results in queue"""
             try:
-                for process_log, final_result in process_text_stream(text, max_iterations, temperature, top_p):
+                for process_log, final_result in process_text_stream(
+                    text, max_iterations, temperature, top_p, reranking, functions
+                ):
                     queues[queue_idx].put((process_log, final_result))
             except Exception as e:
                 queues[queue_idx].put((f"❌ Ошибка в потоке: {str(e)}", ""))
@@ -246,7 +354,7 @@ with gr.Blocks(title="RuWordNet Taxonomy Prediction Client", theme=gr.themes.Sof
         for i in range(3):
             thread = threading.Thread(
                 target=run_stream,
-                args=(i, text, max_iterations, temperature, top_p)
+                args=(i, text, max_iterations, temperature, top_p, reranking, functions)
             )
             thread.daemon = True
             thread.start()
@@ -287,13 +395,30 @@ with gr.Blocks(title="RuWordNet Taxonomy Prediction Client", theme=gr.themes.Sof
                results[1][0], results[1][1],
                results[2][0], results[2][1])
     
-    # Connect button to parallel processing function
-    run_btn.click(
+    # Event handlers
+    manual_run_btn.click(
         fn=run_parallel_analysis,
-        inputs=[text_input, max_iterations, temperature, top_p],
+        inputs=[text_input, max_iterations, temperature, top_p, reranking, functions],
         outputs=[process_output_1, result_output_1,
                  process_output_2, result_output_2,
                  process_output_3, result_output_3]
+    )
+    
+    dataset_run_btn.click(
+        fn=lambda dataset_file, corpus_folder, word, max_iter, temp, top_p_val, rerank, funcs: 
+            list(process_dataset_item(
+                dataset_file.name if dataset_file else "", 
+                corpus_folder, word, max_iter, temp, top_p_val, rerank, funcs
+            ))[-1] if dataset_file and corpus_folder and word else ("❌ Заполните все поля", ""),
+        inputs=[dataset_file, corpus_folder, word_dropdown, max_iterations, temperature, top_p, reranking, functions],
+        outputs=[process_output_1, result_output_1]
+    )
+    
+    # Update dataset info when file is uploaded
+    dataset_file.change(
+        fn=lambda file: get_dataset_info(file.name if file else ""),
+        inputs=[dataset_file],
+        outputs=[dataset_info, word_dropdown, word_dropdown]
     )
 
 
