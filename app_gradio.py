@@ -18,7 +18,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 def process_text_stream(text: str, max_iterations: int, temperature: float, top_p: float, 
-                       reranking: bool, functions: list):
+                       reranking: bool, functions: list, output_file: str = None):
     """Process text using the streaming API endpoint"""
     
     # Validate input
@@ -44,7 +44,8 @@ def process_text_stream(text: str, max_iterations: int, temperature: float, top_
         "temperature": temperature,
         "top_p": top_p,
         "reranking": reranking,
-        "functions": functions  # Теперь правильно передается
+        "functions": functions,
+        "output_file": output_file  # Добавляем параметр для сохранения
     }
     
     process_log = ""
@@ -90,8 +91,28 @@ def process_text_stream(text: str, max_iterations: int, temperature: float, top_
                                 process_log += response_info
                                 yield process_log, final_result
                             
+                            elif event_type == 'tracking_saved':
+                                tracking_info = f"💾 Данные отслеживания сохранены в {data['file']} (выбрано узлов: {data['selections_count']})\n"
+                                process_log += tracking_info
+                                yield process_log, final_result
+                            
                             elif event_type == 'final':
                                 final_result = f"✅ Финальный результат:\n\n{data['result']}"
+                                
+                                # Добавляем информацию об отслеживании если есть
+                                if 'tracking_data' in data:
+                                    tracking_data = data['tracking_data']
+                                    tracking_info = f"\n\n📊 Статистика отслеживания:\n"
+                                    tracking_info += f"• Целевое слово: {tracking_data.get('target_word', 'Неизвестно')}\n"
+                                    tracking_info += f"• Выбрано узлов: {tracking_data.get('total_selections', 0)}\n"
+                                    
+                                    if tracking_data.get('selected_synsets'):
+                                        tracking_info += f"• Выбранные синсеты:\n"
+                                        for synset in tracking_data['selected_synsets']:
+                                            tracking_info += f"  - {synset['synset_id']} ({synset['function']})\n"
+                                    
+                                    final_result += tracking_info
+                                
                                 process_log += f"\n{final_result}\n"
                                 process_log += f"\n{'='*54}\n✔️ Анализ завершен\n{'='*54}\n"
                                 yield process_log, final_result
@@ -116,9 +137,18 @@ def process_text_stream(text: str, max_iterations: int, temperature: float, top_
         yield f"❌ Ошибка: {str(e)}", ""
 
 
-def process_dataset_item(dataset_path: str, corpus_folder: str, word: str, 
+def safe_file_path(file_obj):
+    """Безопасно получить путь к файлу"""
+    if file_obj is None:
+        return None
+    if hasattr(file_obj, 'name'):
+        return file_obj.name
+    return str(file_obj)
+
+
+def process_dataset_item(dataset_file, corpus_folder: str, word: str, 
                         max_iterations: int, temperature: float, top_p: float, 
-                        reranking: bool, functions: list):
+                        reranking: bool, functions: list, output_file: str = None):
     """Process a specific word from dataset using corpus text"""
     try:
         # Load corpus text for the word
@@ -127,9 +157,14 @@ def process_dataset_item(dataset_path: str, corpus_folder: str, word: str,
             yield f"❌ Не найден текст для слова: {word}", ""
             return
         
+        # Генерируем имя файла для отслеживания если не указан
+        if not output_file:
+            timestamp = int(time.time())
+            output_file = f"tracking_results/single_word_{word}_{timestamp}.json"
+        
         # Process using the streaming function
         for process_log, final_result in process_text_stream(
-            text, max_iterations, temperature, top_p, reranking, functions
+            text, max_iterations, temperature, top_p, reranking, functions, output_file
         ):
             yield process_log, final_result
     except Exception as e:
@@ -137,6 +172,7 @@ def process_dataset_item(dataset_path: str, corpus_folder: str, word: str,
 
 
 def get_dataset_info(dataset_path: str):
+    """Безопасно загружаем информацию о датасете"""
     if not dataset_path or not os.path.exists(dataset_path):
         return "Датасет не выбран или файл не найден", gr.update(choices=[], interactive=False), gr.update(maximum=1, value=1)
     
@@ -146,7 +182,6 @@ def get_dataset_info(dataset_path: str):
         max_samples = len(words)
         info = f"📊 Загружен датасет: {len(words)} слов"
         
-        # Возвращаем пустые choices для dropdown, но делаем его интерактивным для поиска
         return (
             info, 
             gr.update(choices=[], interactive=True, allow_custom_value=True),
@@ -196,13 +231,11 @@ def validate_word_in_dataset(dataset_path: str, word: str):
     except Exception as e:
         return f"❌ Ошибка проверки: {str(e)}"
 
-# Добавить функцию загрузки текста из корпуса:
 def load_word_text_from_corpus(corpus_folder: str, word: str):
     """Load text for specific word from corpus"""
     if not corpus_folder or not word:
         return ""
     
-    # Ищем файл СЛОВО.txt
     file_path = os.path.join(corpus_folder, f"{word}.txt")
     logger.debug(f'Ищем файл {file_path}')
     
@@ -216,7 +249,6 @@ def load_word_text_from_corpus(corpus_folder: str, word: str):
     
     return f"❌ Файл {word}.txt не найден в корпусе"
 
-# Добавить функцию батч-обработки:
 def process_dataset_batch(dataset_file, corpus_folder, max_samples, batch_size, max_iterations, 
                          temperature, top_p, reranking, functions, progress=gr.Progress()):
     """Process dataset in batches with max_samples limit"""
@@ -224,7 +256,11 @@ def process_dataset_batch(dataset_file, corpus_folder, max_samples, batch_size, 
         return "❌ Выберите датасет и папку корпуса"
     
     try:
-        dataset = load_dataset(dataset_file.name)
+        file_path = safe_file_path(dataset_file)
+        if not file_path:
+            return "❌ Не удалось получить путь к файлу датасета"
+        
+        dataset = load_dataset(file_path)
         all_words = list(dataset.keys())
         
         # Ограничиваем количество слов параметром max_samples
@@ -235,6 +271,10 @@ def process_dataset_batch(dataset_file, corpus_folder, max_samples, batch_size, 
         
         results = {}
         processed_count = 0
+        
+        # Создаем файл для отслеживания всего батча
+        timestamp = int(time.time())
+        batch_tracking_file = f"tracking_results/batch_tracking_{total_words}words_{timestamp}.json"
         
         for i in range(0, total_words, batch_size):
             batch_words = words_to_process[i:i+batch_size]
@@ -251,15 +291,19 @@ def process_dataset_batch(dataset_file, corpus_folder, max_samples, batch_size, 
                         processed_count += 1
                         continue
                     
+                    # Создаем индивидуальный файл отслеживания для каждого слова
+                    word_tracking_file = f"tracking_results/word_{word}_{timestamp}.json"
+                    
                     # Получаем последний результат из генератора
                     stream_results = list(process_text_stream(
-                        text, max_iterations, temperature, top_p, reranking, functions
+                        text, max_iterations, temperature, top_p, reranking, functions, word_tracking_file
                     ))
                     if stream_results:
                         final_log, final_result = stream_results[-1]
                         results[word] = {
                             "result": final_result,
-                            "log": final_log
+                            "log": final_log,
+                            "tracking_file": word_tracking_file
                         }
                     else:
                         results[word] = {"error": "Нет результатов"}
@@ -271,18 +315,32 @@ def process_dataset_batch(dataset_file, corpus_folder, max_samples, batch_size, 
                 processed_count += 1
                 progress(processed_count/total_words, f"Обработано {processed_count}/{total_words} слов")
         
-        # Сохраняем результаты
-        output_file = f"test_results/batch_results_{total_words}words.json"
+        # Сохраняем общие результаты
+        output_file = f"test_results/batch_results_{total_words}words_{timestamp}.json"
+        os.makedirs(os.path.dirname(output_file), exist_ok=True)
+        
         with open(output_file, 'w', encoding='utf-8') as f:
             json.dump(results, f, ensure_ascii=False, indent=2)
         
-        return f"✅ Обработка завершена. Обработано {processed_count} слов из {len(all_words)}. Результаты сохранены в {output_file}"
+        # Сохраняем сводную информацию об отслеживании
+        tracking_summary = {
+            "batch_info": {
+                "total_words": total_words,
+                "processed_count": processed_count,
+                "timestamp": timestamp
+            },
+            "tracking_files": [result.get("tracking_file") for result in results.values() if "tracking_file" in result]
+        }
+        
+        with open(batch_tracking_file, 'w', encoding='utf-8') as f:
+            json.dump(tracking_summary, f, ensure_ascii=False, indent=2)
+        
+        return f"✅ Обработка завершена. Обработано {processed_count} слов из {len(all_words)}.\nРезультаты: {output_file}\nОтслеживание: {batch_tracking_file}"
         
     except Exception as e:
         logger.error(f"Ошибка батч-обработки: {e}")
         return f"❌ Ошибка батч-обработки: {str(e)}"
     
-# Добавить функцию для стартовых узлов:
 def get_start_nodes_info(start_nodes_folder: str):
     """Get information about start nodes folder"""
     if not start_nodes_folder or not os.path.exists(start_nodes_folder):
@@ -306,6 +364,11 @@ with gr.Blocks(title="RuWordNet Taxonomy Prediction Client", theme=gr.themes.Sof
     gr.Markdown("""
     Этот интерфейс обращается к API сервису для анализа текста и определения места понятия в таксономии RuWordNet.
     
+    **Новые возможности:**
+    - 📊 Отслеживание всех выбираемых синсетов в процессе анализа
+    - 💾 Автоматическое сохранение результатов отслеживания в JSON файлы
+    - 📈 Статистика выбранных узлов в финальном результате
+    
     **Инструкция:**
     1. Выберите режим работы: "Ручной ввод" или "Датасет"
     2. Настройте параметры модели и пайплайна
@@ -321,6 +384,13 @@ with gr.Blocks(title="RuWordNet Taxonomy Prediction Client", theme=gr.themes.Sof
             placeholder="Введите текст с тегами <predict_kb>...</predict_kb>",
             lines=10,
             value=example_text
+        )
+        
+        # Output file for tracking
+        manual_output_file = gr.Textbox(
+            label="💾 Файл для сохранения отслеживания (опционально)",
+            placeholder="tracking_results/manual_analysis.json",
+            info="Если не указан, будет создан автоматически"
         )
         
         manual_run_btn = gr.Button("🚀 Запустить анализ (3 параллельных запроса)", variant="primary", size="lg")
@@ -372,7 +442,7 @@ with gr.Blocks(title="RuWordNet Taxonomy Prediction Client", theme=gr.themes.Sof
         
         num_samples = gr.Slider(
             minimum=1,
-            maximum=1,  # Будет обновляться динамически
+            maximum=1,
             value=1,
             step=1,
             label="🔢 Максимум примеров (для батч-режима)"
@@ -383,6 +453,13 @@ with gr.Blocks(title="RuWordNet Taxonomy Prediction Client", theme=gr.themes.Sof
             label="📝 Текст для выбранного слова",
             lines=8,
             interactive=False
+        )
+        
+        # Output file for dataset tracking
+        dataset_output_file = gr.Textbox(
+            label="💾 Файл для сохранения отслеживания датасета (опционально)",
+            placeholder="tracking_results/dataset_analysis.json",
+            info="Если не указан, будет создан автоматически"
         )
         
         with gr.Row():
@@ -463,7 +540,7 @@ with gr.Blocks(title="RuWordNet Taxonomy Prediction Client", theme=gr.themes.Sof
             )
             result_output_1 = gr.Textbox(
                 label="Результат #1",
-                lines=3,
+                lines=5,
                 interactive=False
             )
         
@@ -477,7 +554,7 @@ with gr.Blocks(title="RuWordNet Taxonomy Prediction Client", theme=gr.themes.Sof
             )
             result_output_2 = gr.Textbox(
                 label="Результат #2",
-                lines=3,
+                lines=5,
                 interactive=False
             )
         
@@ -491,7 +568,7 @@ with gr.Blocks(title="RuWordNet Taxonomy Prediction Client", theme=gr.themes.Sof
             )
             result_output_3 = gr.Textbox(
                 label="Результат #3",
-                lines=3,
+                lines=5,
                 interactive=False
             )
     
@@ -512,6 +589,12 @@ with gr.Blocks(title="RuWordNet Taxonomy Prediction Client", theme=gr.themes.Sof
     ---
     ### ℹ️ Информация
     
+    **Новые возможности отслеживания:**
+    - 📊 Все выбираемые синсеты автоматически сохраняются
+    - 💾 Результаты сохраняются в JSON файлы в папке `tracking_results/`
+    - 📈 Финальный результат содержит статистику по выбранным узлам
+    - 🔍 Каждый вызов функции с node_id записывается в историю
+    
     **Параметры пайплайна:**
     - **Переранжирование** - включает дополнительную обработку результатов
     - **Функции** - выберите доступные функции для модели (get_hyponyms, get_hypernyms)
@@ -526,17 +609,26 @@ with gr.Blocks(title="RuWordNet Taxonomy Prediction Client", theme=gr.themes.Sof
     """)
     
     # Function to run 3 parallel processes using threads
-    def run_parallel_analysis(text, max_iterations, temperature, top_p, reranking, functions):
+    def run_parallel_analysis(text, max_iterations, temperature, top_p, reranking, functions, output_file=None):
         """Run 3 parallel analysis processes using threads"""
+        
+        # Generate unique output files for each process if base file is provided
+        output_files = [None, None, None]
+        if output_file:
+            timestamp = int(time.time())
+            base_name = output_file.rsplit('.', 1)[0] if '.' in output_file else output_file
+            extension = output_file.rsplit('.', 1)[1] if '.' in output_file else 'json'
+            for i in range(3):
+                output_files[i] = f"{base_name}_process{i+1}_{timestamp}.{extension}"
         
         # Queues to communicate between threads
         queues = [Queue(), Queue(), Queue()]
         
-        def run_stream(queue_idx, text, max_iterations, temperature, top_p, reranking, functions):
+        def run_stream(queue_idx, text, max_iterations, temperature, top_p, reranking, functions, output_file):
             """Run streaming in a thread and put results in queue"""
             try:
                 for process_log, final_result in process_text_stream(
-                    text, max_iterations, temperature, top_p, reranking, functions
+                    text, max_iterations, temperature, top_p, reranking, functions, output_file
                 ):
                     queues[queue_idx].put((process_log, final_result))
             except Exception as e:
@@ -550,7 +642,7 @@ with gr.Blocks(title="RuWordNet Taxonomy Prediction Client", theme=gr.themes.Sof
         for i in range(3):
             thread = threading.Thread(
                 target=run_stream,
-                args=(i, text, max_iterations, temperature, top_p, reranking, functions)
+                args=(i, text, max_iterations, temperature, top_p, reranking, functions, output_files[i])
             )
             thread.daemon = True
             thread.start()
@@ -594,11 +686,12 @@ with gr.Blocks(title="RuWordNet Taxonomy Prediction Client", theme=gr.themes.Sof
     # Event handlers
     manual_run_btn.click(
         fn=run_parallel_analysis,
-        inputs=[text_input, max_iterations, temperature, top_p, reranking, functions],
+        inputs=[text_input, max_iterations, temperature, top_p, reranking, functions, manual_output_file],
         outputs=[process_output_1, result_output_1,
                  process_output_2, result_output_2,
                  process_output_3, result_output_3]
     )
+    
     start_nodes_folder.change(
         fn=get_start_nodes_info,
         inputs=[start_nodes_folder],

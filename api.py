@@ -6,7 +6,7 @@ import logging
 
 from datetime import datetime
 from pprint import pformat
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Optional
 from dotenv import load_dotenv
 
 from pydantic import BaseModel
@@ -19,6 +19,7 @@ from utils import *
 from io_utils import read_yaml
 from tools import tools as available_tools_config
 from reranker import Reranker, RerankerRequest
+from data_processing import prepare_target
 
 load_dotenv()
 config = read_yaml('config.yml')
@@ -34,6 +35,7 @@ oclient = OpenAI(api_key=os.environ['API_KEY'], base_url=os.environ['BASE_URL'])
 # Initialize logging
 log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 log_dir = './logs'
+os.makedirs(log_dir, exist_ok=True)
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -47,26 +49,76 @@ logger = logging.getLogger(__name__)
 reranker = Reranker(oclient, os.environ['MODEL_NAME'], logger)
 
 
+# Глобальная структура для отслеживания выбранных синсетов
+class SynsetTracker:
+    def __init__(self):
+        self.selected_synsets = []
+        self.target_word = None
+    
+    def add_synset(self, synset_id: str, function_name: str, args: dict):
+        """Добавить выбранный синсет в трекер"""
+        self.selected_synsets.append({
+            'synset_id': synset_id,
+            'function': function_name,
+            'args': args,
+            'timestamp': datetime.now().isoformat()
+        })
+    
+    def set_target(self, target: str):
+        """Установить целевое слово"""
+        self.target_word = target
+
+    def set_final_synset(self, final_synset: Optional[str]):
+        if final_synset:
+            self.selected_synsets.append(final_synset)
+    
+    def clear(self):
+        """Очистить трекер"""
+        self.selected_synsets.clear()
+        self.target_word = None
+    
+    def get_tracking_data(self):
+        """Получить данные отслеживания"""
+        return {
+            'target_word': self.target_word,
+            'selected_synsets': self.selected_synsets,
+            'total_selections': len(self.selected_synsets)
+        }
+
+
 # Request/Response models
 class PredictionRequest(BaseModel):
     text: str
     max_iterations: int = 50
     temperature: float = 0.5
     top_p: float = 0.95
-    # Новые параметры пайплайна
     reranking: bool = False
     functions: list = ["get_hyponyms"]
+    output_file: str = None  # Новый параметр для сохранения результатов
 
 class PredictionResponse(BaseModel):
     result: str
     iterations: int
     full_conversation: list = None
+    tracking_data: dict = None  # Данные отслеживания
 
 
-def get_hyponyms(node_id, reranking=False, threshold=3):
+def extract_target_word(text: str) -> str:
+    """Извлечь целевое слово из тегов <predict_kb>"""
+    match = re.search(r'<predict_kb>(.*?)</predict_kb>', text)
+    return prepare_target(match.group(1).strip()) if match else "unknown"
+
+def get_synset_id_from_response(text: str) -> str:
+    """Извлечь id синсета из текста"""
+    match = re.findall(r'\d{1,6}-[ANV]', text)
+    return match[-1] if match else None
+
+
+async def get_hyponyms(node_id, reranking=False, threshold=0, tracker: SynsetTracker = None):
     """Tool function for getting hyponyms and formatting as markdown"""
     if node_id == 'null':
         node_id = None
+    
     
     results = wordnet.get_hyponyms(node_id, pos='N')
 
@@ -74,56 +126,51 @@ def get_hyponyms(node_id, reranking=False, threshold=3):
     if not results:
         return "Гипонимов не найдено."
 
-    # Если включено переранжирование и есть результаты, применяем его
-    if reranking and results and len(results) > threshold:
+    # Улучшенное переранжирование с использованием target_word из трекера
+    if reranking and results and tracker and tracker.target_word:
         try:
-            # Извлекаем имена синсетов как кандидатов
             candidates = tuple(item['name'] for item in results)
+
+            # Адаптивный трешхолд (зависит от глубины понятия)
+            gen = wordnet.find_generation(node_id)
+            if gen >= 0:
+                threshold = min(gen + 1, 5)
             
-            # Получаем target word из контекста (это нужно передать в функцию)
-            # Пока используем заглушку - в реальности target нужно получать из вызова
-            target_word = "unknown"  # TODO: передавать target из вызывающего кода
-            
-            # Создаем запрос на переранжирование
             rerank_request = RerankerRequest(
-                target=target_word,
+                target=tracker.target_word,
                 candidates=candidates,
-                threshold=threshold/5.0,  # Конвертируем в шкалу 0-1
+                threshold=threshold/5.0,
                 rel='hyponym'
             )
             
-            # Применяем переранжирование (синхронно)
-            import asyncio
-            reranked = asyncio.run(reranker(rerank_request))
+            reranked = await reranker(rerank_request)
             
-            # Фильтруем результаты согласно переранжированию
             reranked_names = {item['candidate'] for item in reranked}
             results = [item for item in results if item['name'] in reranked_names]
             
-            logger.info(f"Реранкинг сократил результаты с {len(candidates)} до {len(results)}")
+            logger.info(f"Реранкинг для '{tracker.target_word}' сократил результаты с {len(candidates)} до {len(results)}")
             
         except Exception as e:
             logger.error(f"Ошибка реранкинга: {e}")
-            # Продолжаем с исходными результатами в случае ошибки
+
+    # Отслеживание выбранного синсета
+    if tracker and node_id:
+        tracker.add_synset(node_id, "get_hyponyms", {"node_id": node_id, "reranking": reranking, "threshold": threshold})
     
     markdown = f"**Найдено гипонимов: {len(results)}**\n"
     
     for i, item in enumerate(results, 1):
-        # Header with name and ID
         markdown += f"### {i}. {item['name']} `{item['id']}`\n"
         
-        # Definition (if available)
         if item.get('definition'):
             markdown += f"**Определение:** {item['definition']}\n"
         
-        # Words (limit to first 5 for brevity)
         words = item['words'][:5]
         words_str = "; ".join(words)
         if len(item['words']) > 5:
             words_str += f" *(+{len(item['words']) - 5} ещё)*"
         markdown += f"**Слова:** {words_str}\n"
         
-        # Hyponyms (show count and first few names)
         if item['hyponyms']:
             hyponyms_preview = "; ".join(item['hyponyms'][:10])
             if len(item['hyponyms']) > 10:
@@ -137,35 +184,34 @@ def get_hyponyms(node_id, reranking=False, threshold=3):
     return markdown
 
 
-def get_hypernyms(node_id):
+async def get_hypernyms(node_id, tracker: SynsetTracker = None):
     """Tool function for getting hypernyms and formatting as markdown"""
     if node_id == 'null':
         node_id = None
     
+    # Отслеживание выбранного синсета
+    if tracker and node_id:
+        tracker.add_synset(node_id, "get_hypernyms", {"node_id": node_id})
+    
     results = wordnet.get_hypernyms(node_id, pos='N')
 
-    # Format as clean markdown
     if not results:
         return "Гиперонимов не найдено."
     
     markdown = f"**Найдено гиперонимов: {len(results)}**\n"
     
     for i, item in enumerate(results, 1):
-        # Header with name and ID
         markdown += f"### {i}. {item['name']} `{item['id']}`\n"
         
-        # Definition (if available)
         if item.get('definition'):
             markdown += f"**Определение:** {item['definition']}\n"
         
-        # Words (limit to first 5 for brevity)
         words = item['words'][:5]
         words_str = "; ".join(words)
         if len(item['words']) > 5:
             words_str += f" *(+{len(item['words']) - 5} ещё)*"
         markdown += f"**Слова:** {words_str}\n"
         
-        # Hypernyms (show count and first few names)
         if item['hypernyms']:
             hypernyms_preview = "; ".join(item['hypernyms'][:10])
             if len(item['hypernyms']) > 10:
@@ -179,6 +225,32 @@ def get_hypernyms(node_id):
     return markdown
 
 
+def save_tracking_data(tracking_data: dict, output_file: str):
+    """Сохранить данные отслеживания в файл"""
+    try:
+        os.makedirs(os.path.dirname(output_file), exist_ok=True)
+        
+        # Если файл уже существует, загружаем и добавляем новые данные
+        if os.path.exists(output_file):
+            with open(output_file, 'r', encoding='utf-8') as f:
+                existing_data = json.load(f)
+            
+            if isinstance(existing_data, list):
+                existing_data.append(tracking_data)
+            else:
+                existing_data = [existing_data, tracking_data]
+        else:
+            existing_data = [tracking_data]
+        
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(existing_data, f, ensure_ascii=False, indent=2)
+        
+        logger.info(f"Данные отслеживания сохранены в {output_file}")
+        
+    except Exception as e:
+        logger.error(f"Ошибка сохранения данных отслеживания: {e}")
+
+
 def get_system_prompt(functions: list):
     """Выбрать подходящий системный промпт в зависимости от функций"""
     if set(functions) == {"get_hyponyms"}:
@@ -188,21 +260,23 @@ def get_system_prompt(functions: list):
     elif set(functions) == {"get_hyponyms", "get_hypernyms"}:
         return read_prompt('system', logger)
     else:
-        # Fallback на обычный системный промпт
         return read_prompt('system', logger)
-    
 
+    
 available_tools = {
     "get_hyponyms": get_hyponyms,
     "get_hypernyms": get_hypernyms
 }
 
     
-def process_prediction(text: str, max_iterations: int, temperature: float, top_p: float, 
-                      reranking: bool, functions: list):
+async def process_prediction(text: str, max_iterations: int, temperature: float, top_p: float, 
+                      reranking: bool, functions: list, output_file: str = None):
     """Process prediction without streaming"""
     
-    # Выбрать подходящий системный промпт
+    # Создаем трекер для отслеживания выбранных синсетов
+    tracker = SynsetTracker()
+    tracker.set_target(extract_target_word(text))
+    
     system_prompt = get_system_prompt(functions)
     
     messages = [
@@ -216,10 +290,10 @@ def process_prediction(text: str, max_iterations: int, temperature: float, top_p
     elif set(functions) == {"get_hypernyms"}:
         filtered_tools = available_tools_config['hypernym_only'] 
     else:
-        # Объединить оба набора инструментов
         filtered_tools = available_tools_config['hyponym_only'] + available_tools_config['hypernym_only']
     
     final_result = None
+    final_synset = None
     iteration_count = 0
     
     for i in range(max_iterations):
@@ -229,7 +303,7 @@ def process_prediction(text: str, max_iterations: int, temperature: float, top_p
             response_obj = oclient.chat.completions.create(
                 model=os.environ['MODEL_NAME'],
                 messages=messages,
-                tools=filtered_tools,  # Используем фильтрованный список
+                tools=filtered_tools,
                 temperature=temperature,
                 top_p=top_p,
                 max_tokens=4000,
@@ -243,13 +317,7 @@ def process_prediction(text: str, max_iterations: int, temperature: float, top_p
         # Check if this is the final response
         if not response_message.tool_calls:
             final_result = response_message.content.strip()
-            
-            # Применение переранжирования если включено
-            if reranking and final_result:
-                logger.info("Applying reranking to final result")
-                # Здесь будет логика переранжирования когда API будет готово
-                # final_result = apply_reranking(final_result)
-            
+            final_synset = get_synset_id_from_response(final_result)
             break
         
         # Process tool calls
@@ -262,13 +330,17 @@ def process_prediction(text: str, max_iterations: int, temperature: float, top_p
                 continue
             
             function_args = json.loads(tool_call.function.arguments)
-            function_response = function_to_call(**function_args)
             
-            # Return markdown directly, not as JSON
+            # Передаем трекер в функцию
+            if function_name in ["get_hyponyms", "get_hypernyms"]:
+                function_args['tracker'] = tracker
+            
+            function_response = await function_to_call(**function_args)
+            
             tool_messages.append({
                 "tool_call_id": tool_call.id,
                 "role": "tool",
-                "content": function_response  # Already formatted as markdown
+                "content": function_response
             })
         
         messages.extend(tool_messages)
@@ -276,19 +348,36 @@ def process_prediction(text: str, max_iterations: int, temperature: float, top_p
     if final_result is None:
         final_result = "Достигнут лимит итераций"
     
+    # Получаем данные отслеживания
+    tracker.set_final_synset(final_synset)
+    tracking_data = tracker.get_tracking_data()
+    tracking_data['final_result'] = final_result
+    tracking_data['iterations'] = iteration_count
+    tracking_data['timestamp'] = datetime.now().isoformat()
+    
+    # Сохраняем данные отслеживания если указан файл
+    if output_file:
+        save_tracking_data(tracking_data, output_file)
+    
     return {
         "result": final_result,
         "iterations": iteration_count,
-        "full_conversation": messages
+        "full_conversation": messages,
+        "tracking_data": tracking_data
     }
 
 
 async def process_prediction_stream(text: str, max_iterations: int, temperature: float, top_p: float,
-                                   reranking: bool, functions: list) -> AsyncGenerator[str, None]:
+                                   reranking: bool, functions: list, output_file: str = None) -> AsyncGenerator[str, None]:
     """Process prediction with streaming"""
     
-    # Логирование параметров пайплайна
+    # Создаем трекер для отслеживания выбранных синсетов
+    tracker = SynsetTracker()
+    tracker.set_target(extract_target_word(text))
+    
     logger.info(f"Pipeline parameters - reranking: {reranking}, functions: {functions}")
+    logger.info(f"Target word: {tracker.target_word}")
+    
     system_prompt = get_system_prompt(functions)
     
     messages = [
@@ -302,7 +391,6 @@ async def process_prediction_stream(text: str, max_iterations: int, temperature:
     elif set(functions) == {"get_hypernyms"}:
         filtered_tools = available_tools_config['hypernym_only'] 
     else:
-        # Объединить оба набора инструментов
         filtered_tools = available_tools_config['hyponym_only'] + available_tools_config['hypernym_only']
     
     for i in range(max_iterations):
@@ -312,7 +400,7 @@ async def process_prediction_stream(text: str, max_iterations: int, temperature:
             response_obj = oclient.chat.completions.create(
                 model=os.environ['MODEL_NAME'],
                 messages=messages,
-                tools=filtered_tools,  # Используем фильтрованный список
+                tools=filtered_tools,
                 temperature=temperature,
                 top_p=top_p,
                 max_tokens=4000,
@@ -333,13 +421,18 @@ async def process_prediction_stream(text: str, max_iterations: int, temperature:
         if not response_message.tool_calls:
             final_result = response_message.content.strip()
             
-            # Применение переранжирования если включено
-            if reranking and final_result:
-                yield f"data: {json.dumps({'type': 'reranking', 'message': 'Применение переранжирования...'}, ensure_ascii=False)}\n\n"
-                # Здесь будет логика переранжирования когда API будет готово
-                # final_result = apply_reranking(final_result)
+            # Получаем данные отслеживания
+            tracking_data = tracker.get_tracking_data()
+            tracking_data['final_result'] = final_result
+            tracking_data['iterations'] = i + 1
+            tracking_data['timestamp'] = datetime.now().isoformat()
             
-            yield f"data: {json.dumps({'type': 'final', 'result': final_result}, ensure_ascii=False)}\n\n"
+            # Сохраняем данные отслеживания если указан файл
+            if output_file:
+                save_tracking_data(tracking_data, output_file)
+                yield f"data: {json.dumps({'type': 'tracking_saved', 'file': output_file, 'selections_count': len(tracking_data['selected_synsets'])}, ensure_ascii=False)}\n\n"
+            
+            yield f"data: {json.dumps({'type': 'final', 'result': final_result, 'tracking_data': tracking_data}, ensure_ascii=False)}\n\n"
             return
         
         # Process tool calls
@@ -361,41 +454,42 @@ async def process_prediction_stream(text: str, max_iterations: int, temperature:
             
             yield f"data: {json.dumps({'type': 'tool_call', 'function': function_name, 'args': function_args, 'node_name': node_name}, ensure_ascii=False)}\n\n"
             
-            function_response = function_to_call(**function_args)
+            # Передаем трекер в функцию
+            if function_name in ["get_hyponyms", "get_hypernyms"]:
+                function_args['tracker'] = tracker
+                function_args['reranking'] = reranking
+            
+            function_response = await function_to_call(**function_args)
             
             # Send the function response (markdown) to client
             yield f"data: {json.dumps({'type': 'tool_response', 'content': function_response}, ensure_ascii=False)}\n\n"
             
-            # Return markdown directly, not as JSON
             tool_messages.append({
                 "tool_call_id": tool_call.id,
                 "role": "tool",
-                "content": function_response  # Already formatted as markdown
+                "content": function_response
             })
         
         messages.extend(tool_messages)
-        await asyncio.sleep(0.01)  # Small delay for streaming effect
+        await asyncio.sleep(0.01)
     
     yield f"data: {json.dumps({'type': 'error', 'message': 'Достигнут лимит итераций'}, ensure_ascii=False)}\n\n"
 
 
 @app.post("/predict", response_model=PredictionResponse)
 async def predict(request: PredictionRequest):
-    """
-    Regular prediction endpoint that returns the final result.
-    
-    The text must contain exactly one occurrence of <predict_kb>...</predict_kb> tags.
-    """
+    """Regular prediction endpoint that returns the final result."""
     if '<predict_kb>' not in request.text or '</predict_kb>' not in request.text:
         raise HTTPException(status_code=400, detail="Text must contain <predict_kb>...</predict_kb> tags")
     
-    result = process_prediction(
+    result = await process_prediction(
         text=request.text,
         max_iterations=request.max_iterations,
         temperature=request.temperature,
         top_p=request.top_p,
         reranking=request.reranking,
-        functions=request.functions
+        functions=request.functions,
+        output_file=request.output_file
     )
     
     return result
@@ -403,19 +497,7 @@ async def predict(request: PredictionRequest):
 
 @app.post("/predict/stream")
 async def predict_stream(request: PredictionRequest):
-    """
-    Streaming prediction endpoint that returns the process in real-time.
-    
-    The text must contain exactly one occurrence of <predict_kb>...</predict_kb> tags.
-    
-    Stream format (Server-Sent Events):
-    - type: 'iteration' - New iteration started
-    - type: 'thought' - Assistant's reasoning
-    - type: 'tool_call' - Function call made
-    - type: 'final' - Final result
-    - type: 'error' - Error occurred
-    - type: 'reranking' - Reranking is being applied
-    """
+    """Streaming prediction endpoint that returns the process in real-time."""
     if '<predict_kb>' not in request.text or '</predict_kb>' not in request.text:
         msg = "Text must contain <predict_kb>...</predict_kb> tags"
         logger.error(msg)
@@ -428,7 +510,8 @@ async def predict_stream(request: PredictionRequest):
             temperature=request.temperature,
             top_p=request.top_p,
             reranking=request.reranking,
-            functions=request.functions
+            functions=request.functions,
+            output_file=request.output_file
         ),
         media_type="text/event-stream"
     )
