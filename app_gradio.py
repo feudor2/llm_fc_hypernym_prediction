@@ -1,3 +1,8 @@
+import asyncio
+import httpx
+from concurrent.futures import ThreadPoolExecutor
+
+import re
 import gradio as gr
 import requests
 import json
@@ -8,35 +13,37 @@ import time
 import os
 import glob
 from pathlib import Path
+from pprint import pformat
 
 # Импортируем функции для работы с данными
-from data_processing import load_dataset, load_corpus_text
+from data_processing import load_dataset, load_corpus_text, load_start_nodes, convert_paths
+from io_utils import read_json
 
 import logging
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+http_client = httpx.AsyncClient(timeout=300.0)
+
 def process_text_stream(text: str, max_iterations: int, temperature: float, top_p: float, 
-                       reranking: bool, functions: list, output_file: str = None):
-    """Process text using the streaming API endpoint"""
+                       reranking: bool, interpreting: bool, functions: list, output_file: str = None, start_node_id: str = None):
+    """Process text using the streaming API endpoint with optional start node"""
     
     # Validate input
     if '<predict_kb>' not in text or '</predict_kb>' not in text:
         yield "❌ Ошибка: Текст должен содержать теги <predict_kb>...</predict_kb>", ""
         return
     
-    # Исправить координацию с tools.py
     valid_functions = ["get_hyponyms", "get_hypernyms"]
     functions = [f for f in functions if f in valid_functions]
     
     if not functions:
-        functions = ["get_hyponyms"]  # Fallback
+        functions = ["get_hyponyms"]
     
-    # API URL (hardcoded)
     api_url = "http://localhost:8500"
     
-    # Prepare request with pipeline parameters
+    # Prepare request with optional start node
     endpoint = f"{api_url.rstrip('/')}/predict/stream"
     payload = {
         "text": text,
@@ -44,12 +51,21 @@ def process_text_stream(text: str, max_iterations: int, temperature: float, top_
         "temperature": temperature,
         "top_p": top_p,
         "reranking": reranking,
+        "interpreting": interpreting,
         "functions": functions,
-        "output_file": output_file  # Добавляем параметр для сохранения
+        "output_file": output_file
     }
+    
+    # Добавляем стартовый узел если указан
+    if start_node_id:
+        payload["start_node_id"] = start_node_id
+    
+    # Остальная логика остается той же...
     
     process_log = ""
     final_result = ""
+
+    logger.info(f'Sending request with payload {pformat(payload)}')
     
     try:
         # Make streaming request
@@ -146,14 +162,19 @@ def safe_file_path(file_obj):
     return str(file_obj)
 
 
-def process_dataset_item(dataset_file, corpus_folder: str, word: str, 
-                        max_iterations: int, temperature: float, top_p: float, 
-                        reranking: bool, functions: list, output_file: str = None):
+def process_dataset_item(
+        dataset_path: str, corpus_folder: str, word: str, 
+        max_iterations: int, temperature: float, top_p: float, 
+        reranking: bool, interpreting: bool, functions: list, 
+        num_processes: int, start_nodes_folder: str, max_n_starting_nodes: int,
+        parallel_mode: str, output_file: str = None
+    ):
     """Process a specific word from dataset using corpus text"""
     try:
         # Load corpus text for the word
-        text = load_corpus_text(corpus_folder, word)
-        if not text:
+        dataset = convert_paths(load_dataset(dataset_path), 0)
+        texts = [load_corpus_text(corpus_folder, item_path) for item_path in dataset[word]]
+        if not texts:
             yield f"❌ Не найден текст для слова: {word}", ""
             return
         
@@ -163,10 +184,11 @@ def process_dataset_item(dataset_file, corpus_folder: str, word: str,
             output_file = f"tracking_results/single_word_{word}_{timestamp}.json"
         
         # Process using the streaming function
-        for process_log, final_result in process_text_stream(
-            text, max_iterations, temperature, top_p, reranking, functions, output_file
+        for results in run_parallel_analysis(
+            word, texts, max_iterations, temperature, top_p, reranking, interpreting, functions, output_file,
+            num_processes, start_nodes_folder, max_n_starting_nodes, parallel_mode
         ):
-            yield process_log, final_result
+            yield results
     except Exception as e:
         yield f"❌ Ошибка при обработке слова '{word}': {str(e)}", ""
 
@@ -185,15 +207,17 @@ def get_dataset_info(dataset_path: str):
         return (
             info, 
             gr.update(choices=[], interactive=True, allow_custom_value=True),
-            gr.update(maximum=max_samples, value=max_samples, interactive=True)
+            gr.update(maximum=max_samples, value=1, interactive=True),
+            gr.update(maximum=max_samples, value=max_samples, interactive=True),
+            max_samples
         )
     except Exception as e:
-        return f"❌ Ошибка загрузки датасета: {str(e)}", gr.update(choices=[], interactive=False), gr.update(maximum=1, value=1)
+        return f"❌ Ошибка загрузки датасета: {str(e)}", gr.update(choices=[], interactive=False), gr.update(maximum=1, value=1), 1, 1
 
 def search_words_in_dataset(dataset_path: str, search_query: str):
     """Search for words in dataset that match the query"""
     if not dataset_path or not search_query:
-        return gr.update(choices=[])
+        return gr.update(value=search_query.upper(), choices=[])
     
     try:
         dataset = load_dataset(dataset_path)
@@ -206,10 +230,10 @@ def search_words_in_dataset(dataset_path: str, search_query: str):
         # Ограничиваем результат до 50 слов для производительности
         matching_words = matching_words[:50]
         
-        return gr.update(choices=matching_words)
+        return gr.update(value=search_query.upper(), choices=matching_words)
     except Exception as e:
         logger.error(f"Ошибка поиска в датасете: {e}")
-        return gr.update(choices=[])
+        return gr.update(value=search_query.upper(), choices=[])
 
 def validate_word_in_dataset(dataset_path: str, word: str):
     """Validate that the word exists in dataset"""
@@ -231,123 +255,226 @@ def validate_word_in_dataset(dataset_path: str, word: str):
     except Exception as e:
         return f"❌ Ошибка проверки: {str(e)}"
 
-def load_word_text_from_corpus(corpus_folder: str, word: str):
+def load_word_text_from_corpus(dataset_path, corpus_folder: str, word: str, index: int = 0):
     """Load text for specific word from corpus"""
-    if not corpus_folder or not word:
-        return ""
+    if not dataset_path or not corpus_folder or not word:
+        return "", gr.update(), 0, gr.update()
     
-    file_path = os.path.join(corpus_folder, f"{word}.txt")
-    logger.debug(f'Ищем файл {file_path}')
+    dataset = load_dataset(dataset_path)
+    paths = convert_paths({word: dataset[word]})[word]
+    n_texts = len(paths)
     
-    if os.path.exists(file_path):
+    if paths:
+        if index >= n_texts:
+            index = 0
+        elif index < 0:
+            index = n_texts - 1
         try:
-            text = load_corpus_text(corpus_folder, word)
+            text = load_corpus_text(corpus_folder, paths[index])
             logger.debug(f'Извлечённый текст {text}')
-            return text
+            interactive = len(paths) > 1
+            return text, gr.update(interactive=interactive), str(index + 1), gr.update(interactive=interactive)
         except Exception as e:
-            return f"❌ Ошибка чтения файла: {str(e)}"
+            return f"❌ Ошибка чтения файла: {str(e)}", gr.update(), '0', gr.update()
     
-    return f"❌ Файл {word}.txt не найден в корпусе"
+    return f"❌ Для слова {word} не найдено текстов в корпусе", gr.update(), '0', gr.update()
 
-def process_dataset_batch(dataset_file, corpus_folder, max_samples, batch_size, max_iterations, 
-                         temperature, top_p, reranking, functions, progress=gr.Progress()):
-    """Process dataset in batches with max_samples limit"""
+async def process_dataset_batch_async(dataset_file, corpus_folder, sample_start, max_samples, num_processes, batch_size,
+                                     max_iterations, temperature, top_p, reranking, interpreting, functions, 
+                                     start_nodes_path, max_n_starting_nodes, parallel_mode, progress=None):
+    """Асинхронная батч-обработка с поддержкой множественных процессов"""
+    start_time = int(time.time())
+
     if not dataset_file or not corpus_folder:
         return "❌ Выберите датасет и папку корпуса"
     
-    try:
-        file_path = safe_file_path(dataset_file)
-        if not file_path:
-            return "❌ Не удалось получить путь к файлу датасета"
-        
-        dataset = load_dataset(file_path)
-        all_words = list(dataset.keys())
-        
-        # Ограничиваем количество слов параметром max_samples
-        words_to_process = all_words[:max_samples]
-        total_words = len(words_to_process)
-        
-        logger.info(f"Обработка {total_words} слов из {len(all_words)} (ограничение: {max_samples})")
-        
-        results = {}
-        processed_count = 0
-        
-        # Создаем файл для отслеживания всего батча
-        timestamp = int(time.time())
-        batch_tracking_file = f"tracking_results/batch_tracking_{total_words}words_{timestamp}.json"
-        
-        for i in range(0, total_words, batch_size):
-            batch_words = words_to_process[i:i+batch_size]
-            batch_end = min(i + batch_size, total_words)
-            
-            progress((processed_count)/total_words, f"Обработка слов {i+1}-{batch_end} из {total_words}")
-            
-            # Обрабатываем каждое слово в батче
-            for word in batch_words:
-                try:
-                    text = load_word_text_from_corpus(corpus_folder, word)
-                    if "❌" in text:
-                        results[word] = {"error": text}
-                        processed_count += 1
-                        continue
-                    
-                    # Создаем индивидуальный файл отслеживания для каждого слова
-                    word_tracking_file = f"tracking_results/word_{word}_{timestamp}.json"
-                    
-                    # Получаем последний результат из генератора
-                    stream_results = list(process_text_stream(
-                        text, max_iterations, temperature, top_p, reranking, functions, word_tracking_file
-                    ))
-                    if stream_results:
-                        final_log, final_result = stream_results[-1]
-                        results[word] = {
-                            "result": final_result,
-                            "log": final_log,
-                            "tracking_file": word_tracking_file
-                        }
-                    else:
-                        results[word] = {"error": "Нет результатов"}
-                        
-                except Exception as e:
-                    logger.error(f"Ошибка обработки слова {word}: {e}")
-                    results[word] = {"error": str(e)}
+    # Загружаем данные
+    file_path = safe_file_path(dataset_file)
+    dataset = convert_paths(load_dataset(file_path), 0)
+    start_nodes_dict = load_start_nodes(start_nodes_path) if start_nodes_path and max_n_starting_nodes > 0 else {}
+    
+    words_to_process = list(dataset.keys())[sample_start-1:sample_start+max_samples-1]
+    total_tasks = 0
+    
+    # Подсчитываем общее количество задач
+    for word in words_to_process:
+        if word in start_nodes_dict and max_n_starting_nodes > 0 and parallel_mode == "по стартовым узлам":
+            word_nodes = start_nodes_dict[word][:max_n_starting_nodes]
+            total_tasks += len(word_nodes)
+        elif max_n_starting_nodes > 0 and parallel_mode == "по стартовым узлам":
+            logger.warning(f'Word {word} not found in start nodes list ({list(start_nodes_dict.keys())[0]},...)')
+        elif parallel_mode == "по текстам" and dataset[word]:
+            total_tasks += len(dataset[word])
+        elif parallel_mode == "по текстам":
+            logger.warning(f'No texts for {word} found in the dataset')
+        else:
+            total_tasks += num_processes
+    
+    logger.info(f"Запуск {total_tasks} задач для {len(words_to_process)} слов")
+    
+    # Создаем семафор для ограничения одновременных запросов
+    semaphore = asyncio.Semaphore(min(total_tasks, 10))  # Максимум 10 одновременных запросов
+    
+    async def process_single_task(word, text, start_node_id, task_id):
+        async with semaphore:
+            try:
+                # Подготовка запроса
+                payload = {
+                    "text": text,
+                    "max_iterations": max_iterations,
+                    "temperature": temperature,
+                    "top_p": top_p,
+                    "reranking": reranking,
+                    "interpreting": interpreting,
+                    "functions": functions,
+                    "output_file": f"tracking_results/batch_{start_time}/async_word_{word}_[{task_id}].json"
+                }
                 
-                processed_count += 1
-                progress(processed_count/total_words, f"Обработано {processed_count}/{total_words} слов")
+                # Добавляем стартовый узел если есть
+                if start_node_id:
+                    payload["start_node_id"] = start_node_id
+                
+                # Асинхронный вызов API
+                response = await http_client.post(
+                    "http://localhost:8500/predict",
+                    json=payload
+                )
+                response.raise_for_status()
+                
+                result_data = response.json()
+                return {
+                    "word": word,
+                    "result": result_data.get("result"),
+                    "iterations": result_data.get("iterations"),
+                    "task_id": task_id,
+                    "start_node_id": start_node_id
+                }
+                
+            except Exception as e:
+                logger.error(f"Ошибка обработки задачи {task_id} для слова {word}: {e}")
+                return {
+                    "word": word,
+                    "error": str(e),
+                    "task_id": task_id,
+                    "start_node_id": start_node_id
+                }
+    
+    # Обновляем прогресс
+    if progress:
+        progress(0.1, f"Создано {total_tasks} задач для {len(words_to_process)} слов")
+    
+    # Выполняем все задачи с обновлением прогресса
+    completed_tasks = 0
+    results = []
+
+    tasks = []
+    
+    for w, word in enumerate(words_to_process):
+        if word in start_nodes_dict and max_n_starting_nodes > 0:
+            # Используем предзаданные узлы
+            word_nodes = start_nodes_dict[word][:max_n_starting_nodes]
+        else:
+            word_nodes = []
+
+        if parallel_mode == 'по текстам':
+            for t, path in enumerate(dataset[word]):
+                text = load_corpus_text(corpus_folder, path)
+                if not text or "❌" in text:
+                    continue
+                if word_nodes:
+                    for n, node_id in enumerate(word_nodes):
+                        task_id = f'{w}_{t}_{n}_0'
+                        tasks.append(process_single_task(word, text, node_id, task_id))
+                else:
+                    task_id = f'{w}_{t}__0'
+                    tasks.append(process_single_task(word, text, None, task_id))
+        else:
+            text = load_corpus_text(corpus_folder, dataset[word][0])
+            if not text or "❌" in text:
+                continue
+            if parallel_mode == 'по стартовым узлам':
+                for n, node_id in enumerate(word_nodes):
+                    task_id = f'{w}_0_{n}_0'
+                    tasks.append(process_single_task(word, text, node_id, task_id))
+            else:
+                # Стандартный режим с несколькими процессами
+                for i in range(num_processes):
+                    task_id = f'{w}_0__{i}'
+                    tasks.append(process_single_task(word, text, None, task_id))
+
+    
+    # Обрабатываем задачи батчами для обновления прогресса
+    for i in range(0, len(tasks), batch_size):
+        batch_tasks = tasks[i:i+batch_size]
+        batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+        results.extend(batch_results)
         
-        # Сохраняем общие результаты
-        output_file = f"test_results/batch_results_{total_words}words_{timestamp}.json"
-        os.makedirs(os.path.dirname(output_file), exist_ok=True)
-        
-        with open(output_file, 'w', encoding='utf-8') as f:
-            json.dump(results, f, ensure_ascii=False, indent=2)
-        
-        # Сохраняем сводную информацию об отслеживании
-        tracking_summary = {
-            "batch_info": {
-                "total_words": total_words,
-                "processed_count": processed_count,
-                "timestamp": timestamp
-            },
-            "tracking_files": [result.get("tracking_file") for result in results.values() if "tracking_file" in result]
-        }
-        
-        with open(batch_tracking_file, 'w', encoding='utf-8') as f:
-            json.dump(tracking_summary, f, ensure_ascii=False, indent=2)
-        
-        return f"✅ Обработка завершена. Обработано {processed_count} слов из {len(all_words)}.\nРезультаты: {output_file}\nОтслеживание: {batch_tracking_file}"
-        
+        completed_tasks += len(batch_tasks)
+        if progress:
+            progress_value = 0.1 + (completed_tasks / total_tasks) * 0.8
+            progress(progress_value, f"Выполнено {completed_tasks}/{total_tasks} задач")
+    
+    # Сохраняем результаты
+    timestamp = int(time.time())
+    output_file = f"test_results/async_batch_{len(words_to_process)}words_{timestamp}.json"
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    
+    # Группируем результаты по словам
+    results_by_word = {}
+    for result in results:
+        if isinstance(result, dict) and 'word' in result:
+            word = result['word']
+            if word not in results_by_word:
+                results_by_word[word] = []
+            results_by_word[word].append(result)
+    
+    with open(output_file, 'w', encoding='utf-8') as f:
+        json.dump(results_by_word, f, ensure_ascii=False, indent=2)
+    
+    if progress:
+        progress(1.0, "Обработка завершена")
+    
+    return f"✅ Асинхронная обработка завершена.\n📊 Выполнено {len(results)} задач для {len(words_to_process)} слов\n💾 Результаты: {output_file}"
+
+def process_dataset_batch(dataset_file, corpus_folder, sample_start, max_samples, num_processes, batch_size,
+                         max_iterations, temperature, top_p, reranking, interpreting, functions,
+                         start_nodes_path, max_n_starting_nodes, parallel_mode, progress=gr.Progress()):
+    """Wrapper для запуска асинхронной батч-обработки"""
+    
+    # Запускаем асинхронную функцию в новом event loop
+    def run_async():
+        try:
+            # Создаем новый event loop для этого потока
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            return loop.run_until_complete(
+                process_dataset_batch_async(
+                    dataset_file, corpus_folder, sample_start, max_samples, num_processes, batch_size,
+                    max_iterations, temperature, top_p, reranking, interpreting, functions,
+                    start_nodes_path, max_n_starting_nodes, parallel_mode, progress
+                )
+            )
+        finally:
+            loop.close()
+    
+    # Выполняем в отдельном потоке чтобы не блокировать Gradio
+    with ThreadPoolExecutor() as executor:
+        future = executor.submit(run_async)
+        return future.result() 
+    
+def get_start_nodes_info(start_nodes_path: str):
+    """Get information about start nodes file"""
+    if not start_nodes_path or not os.path.exists(start_nodes_path):
+        return "Файл со стартовыми узлами не выбран или не найден", gr.update(), gr.update()
+    
+    try:
+        content = read_json(start_nodes_path)
+        total_words = len(content)
+        total_nodes = sum(len(nodes) for nodes in content.values())
+        return f"📁 Загружен файл: {total_words} слов, {total_nodes} стартовых узлов", gr.update(interactive=True, maximum=3), gr.update(choices=['по стартовым узлам']+parallel_mode.choices, value='по стартовым узлам')
     except Exception as e:
-        logger.error(f"Ошибка батч-обработки: {e}")
-        return f"❌ Ошибка батч-обработки: {str(e)}"
-    
-def get_start_nodes_info(start_nodes_folder: str):
-    """Get information about start nodes folder"""
-    if not start_nodes_folder or not os.path.exists(start_nodes_folder):
-        return "Папка стартовых узлов не выбрана или не найдена"
-    
-    json_files = glob.glob(os.path.join(start_nodes_folder, "*.json"))
-    return f"📁 Найдено {len(json_files)} файлов стартовых узлов"
+        return f"❌ Ошибка чтения файла: {str(e)}", gr.update(), gr.update()
 
 
 # Example text
@@ -357,133 +484,27 @@ example_text = '''Каждое лето группы энтузиастов ис
 
 С тех времён модели заметно усовершенствовали, но по-прежнему это изделия из металла, которые крепятся к ботинкам, вгрызаются в лёд и держат на снежном рельефе'''
 
-
+custom_css = """
+.center-text {
+    text-align: center;
+    display: block; /* Ensures the text container behaves like a block element */
+}
+"""
 # Create Gradio interface
-with gr.Blocks(title="RuWordNet Taxonomy Prediction Client", theme=gr.themes.Soft()) as demo:
+with gr.Blocks(title="RuWordNet Taxonomy Prediction Client", theme=gr.themes.Soft(), css=custom_css) as demo:
     gr.Markdown("# 🔍 RuWordNet Taxonomy Prediction Client")
     gr.Markdown("""
     Этот интерфейс обращается к API сервису для анализа текста и определения места понятия в таксономии RuWordNet.
     
-    **Новые возможности:**
-    - 📊 Отслеживание всех выбираемых синсетов в процессе анализа
-    - 💾 Автоматическое сохранение результатов отслеживания в JSON файлы
-    - 📈 Статистика выбранных узлов в финальном результате
-    
     **Инструкция:**
-    1. Выберите режим работы: "Ручной ввод" или "Датасет"
-    2. Настройте параметры модели и пайплайна
+    1. Настройте параметры модели и пайплайна
+    2. Выберите режим работы: "Ручной ввод" или "Датасет"
     3. Введите текст или выберите файлы
     4. Запустите анализ
     """)
-    
-    # Mode selection
-    with gr.Tab("🖊️ Ручной ввод"):
-        # Text input
-        text_input = gr.Textbox(
-            label="📝 Входной текст",
-            placeholder="Введите текст с тегами <predict_kb>...</predict_kb>",
-            lines=10,
-            value=example_text
-        )
-        
-        # Output file for tracking
-        manual_output_file = gr.Textbox(
-            label="💾 Файл для сохранения отслеживания (опционально)",
-            placeholder="tracking_results/manual_analysis.json",
-            info="Если не указан, будет создан автоматически"
-        )
-        
-        manual_run_btn = gr.Button("🚀 Запустить анализ (3 параллельных запроса)", variant="primary", size="lg")
-    
-    with gr.Tab("📊 Режим датасета"):
-        with gr.Row():
-            dataset_file = gr.File(
-                label="📁 Файл датасета (TSV)",
-                file_types=[".tsv"]
-            )
-            corpus_folder = gr.Textbox(
-                label="📂 Папка с корпусом текстов",
-                value="corpus/private",
-                interactive=True
-            )
-        
-        # Папка стартовых узлов
-        start_nodes_folder = gr.Textbox(
-            label="📁 Папка стартовых узлов (JSON)",
-            value="examples",
-            interactive=True
-        )
-        
-        start_nodes_info = gr.Textbox(
-            label="ℹ️ Информация о стартовых узлах",
-            interactive=False
-        )
-        
-        dataset_info = gr.Textbox(
-            label="ℹ️ Информация о датасете",
-            interactive=False
-        )
-        
-        with gr.Row():
-            with gr.Column(scale=3):
-                word_dropdown = gr.Dropdown(
-                    label="🎯 Поиск и выбор слова",
-                    choices=[],
-                    interactive=True,
-                    allow_custom_value=True,
-                    info="Начните печатать для поиска слов в датасете"
-                )
-            with gr.Column(scale=1):
-                word_validation = gr.Textbox(
-                    label="✓ Проверка слова",
-                    interactive=False,
-                    lines=2
-                )
-        
-        num_samples = gr.Slider(
-            minimum=1,
-            maximum=1,
-            value=1,
-            step=1,
-            label="🔢 Максимум примеров (для батч-режима)"
-        )
-        
-        # Текст для выбранного слова
-        word_text_display = gr.Textbox(
-            label="📝 Текст для выбранного слова",
-            lines=8,
-            interactive=False
-        )
-        
-        # Output file for dataset tracking
-        dataset_output_file = gr.Textbox(
-            label="💾 Файл для сохранения отслеживания датасета (опционально)",
-            placeholder="tracking_results/dataset_analysis.json",
-            info="Если не указан, будет создан автоматически"
-        )
-        
-        with gr.Row():
-            dataset_run_btn = gr.Button("🚀 Обработать выбранное слово", variant="primary")
-            batch_run_btn = gr.Button("🔄 Батч-обработка датасета", variant="secondary")
-        
-        # Батч-параметры
-        with gr.Accordion("⚙️ Параметры батч-обработки", open=False):
-            batch_size = gr.Slider(
-                minimum=1,
-                maximum=10,
-                value=3,
-                step=1,
-                label="Размер батча"
-            )
-        
-        batch_results = gr.Textbox(
-            label="📊 Результаты батч-обработки",
-            lines=5,
-            interactive=False
-        )
-    
+
     # Parameters section (shared)
-    with gr.Accordion("⚙️ Параметры", open=True):
+    with gr.Accordion("⚙️ Параметры", open=False):
         with gr.Row():
             # Model parameters
             with gr.Column():
@@ -513,10 +534,16 @@ with gr.Blocks(title="RuWordNet Taxonomy Prediction Client", theme=gr.themes.Sof
             # Pipeline parameters
             with gr.Column():
                 gr.Markdown("**Параметры пайплайна**")
-                reranking = gr.Checkbox(
-                    label="🔄 Переранжирование",
-                    value=False
-                )
+                with gr.Row():
+                    reranking = gr.Checkbox(
+                        label="🔄 Переранжирование",
+                        value=True
+                    )
+                    interpreting = gr.Checkbox(
+                        label="🔍 Семантический анализ",
+                        value=True,
+                        interactive=True
+                    )
                 functions = gr.CheckboxGroup(
                     label="🔧 Функции",
                     choices=[
@@ -525,6 +552,153 @@ with gr.Blocks(title="RuWordNet Taxonomy Prediction Client", theme=gr.themes.Sof
                     ],
                     value=["get_hyponyms"]
                 )
+                num_processes = gr.Slider(
+                    minimum=1,
+                    maximum=3,
+                    value=3,
+                    step=1,
+                    label="🔧 Количество процессов",
+                    info="Количество параллельных процессов для одного слова"
+                )
+                max_n_starting_nodes = gr.Slider(
+                    minimum=0,
+                    maximum=3,
+                    value=0,
+                    step=1,
+                    label="📍 Количество стартовых узлов",
+                    info="0 = стандартный режим, 1-3 = режим с предзаданными узлами",
+                    interactive=False
+                )
+    
+    # Mode selection
+    with gr.Tab("🖊️ Ручной ввод"):
+        # Text input
+        text_input = gr.Textbox(
+            label="📝 Входной текст",
+            placeholder="Введите текст с тегами <predict_kb>...</predict_kb>",
+            lines=10,
+            value=example_text
+        )
+        
+        # Output file for tracking
+        manual_output_file = gr.Textbox(
+            label="💾 Файл для сохранения отслеживания (опционально)",
+            placeholder="tracking_results/manual_analysis.json",
+            info="Если не указан, будет создан автоматически"
+        )
+
+        manual_run_btn = gr.Button("🚀 Запустить анализ (3 параллельных запроса)", variant="primary", size="lg")
+        
+    
+    with gr.Tab("📊 Режим датасета"):
+        with gr.Row():
+            dataset_file = gr.File(
+                label="📁 Файл датасета (TSV)",
+                file_types=[".tsv"]
+            )
+            corpus_folder = gr.Textbox(
+                label="📂 Папка с корпусом текстов",
+                value="C:/Users/Admin/Documents/Thesis/corpus/annotated_texts",
+                interactive=True
+            )
+        
+        # Папка стартовых узлов
+        start_nodes_folder = gr.Textbox(
+            label="📁 Папка стартовых узлов (JSON)",
+            value="examples/yandex-gpt5_candidates.json",
+            interactive=True
+        )
+        
+        start_nodes_info = gr.Textbox(
+            label="ℹ️ Информация о стартовых узлах",
+            interactive=False
+        )
+        
+        dataset_info = gr.Textbox(
+            label="ℹ️ Информация о датасете",
+            interactive=False
+        )
+        
+        with gr.Row():
+            with gr.Column(scale=3):
+                word_dropdown = gr.Dropdown(
+                    label="🎯 Поиск и выбор слова",
+                    choices=[],
+                    interactive=True,
+                    allow_custom_value=True,
+                    info="Начните печатать для поиска слов в датасете"
+                )
+            with gr.Column(scale=1):
+                word_validation = gr.Textbox(
+                    label="✓ Проверка слова",
+                    interactive=False,
+                    lines=2
+                )
+        
+        sample_start = gr.Slider(
+            minimum=1,
+            maximum=1,
+            value=1,
+            step=1,
+            label="🔢 Начальный индекс (для батч-режима)",
+            interactive=False
+        )
+        num_samples = gr.Slider(
+            minimum=1,
+            maximum=1,
+            value=1,
+            step=1,
+            label="🔢 Число примеров (для батч-режима)",
+            interactive=False
+        )
+        dataset_size = gr.State(1)
+        
+        # Текст для выбранного слова
+        word_text_display = gr.Textbox(
+            label="📝 Текст для выбранного слова",
+            lines=8,
+            interactive=False
+        )
+
+        with gr.Row():
+            prev_text_btn = gr.Button("←", variant="secondary", interactive=False)
+            current_text_label = gr.Markdown(value='0', elem_classes="center-text")
+            next_text_btn = gr.Button("→", variant="secondary", interactive=False)
+        
+        # Output file for dataset tracking
+        dataset_output_file = gr.Textbox(
+            label="💾 Файл для сохранения отслеживания датасета (опционально)",
+            placeholder="tracking_results/dataset_analysis.json",
+            info="Если не указан, будет создан автоматически"
+        )
+        
+        
+        # Батч-параметры
+        with gr.Accordion("⚙️ Параметры батч-обработки", open=False):
+            batch_size = gr.Slider(
+                minimum=1,
+                maximum=10,
+                value=3,
+                step=1,
+                label="📦 Размер батча",
+                interactive=True
+            )
+            parallel_mode = gr.Radio(
+                choices=["по текстам", "по умолчанию"],
+                label="🔘 Режим параллелизма",
+                value="по текстам",
+                interactive=True
+            )
+
+        with gr.Row():
+            dataset_run_btn = gr.Button("🚀 Обработать выбранное слово", variant="primary")
+            batch_run_btn = gr.Button("🔄 Батч-обработка датасета", variant="secondary")
+        
+        batch_results = gr.Textbox(
+            label="📊 Результаты батч-обработки",
+            lines=5,
+            interactive=False
+        )
     
     # 3 parallel outputs
     gr.Markdown("### 📊 Параллельные процессы анализа")
@@ -589,14 +763,23 @@ with gr.Blocks(title="RuWordNet Taxonomy Prediction Client", theme=gr.themes.Sof
     ---
     ### ℹ️ Информация
     
-    **Новые возможности отслеживания:**
-    - 📊 Все выбираемые синсеты автоматически сохраняются
-    - 💾 Результаты сохраняются в JSON файлы в папке `tracking_results/`
-    - 📈 Финальный результат содержит статистику по выбранным узлам
-    - 🔍 Каждый вызов функции с node_id записывается в историю
+    **Новые возможности:**
+    1. **Отслеживание**
+        - 📊 Все выбираемые синсеты автоматически сохраняются
+        - 💾 Результаты сохраняются в JSON файлы в папке `tracking_results/`
+        - 📈 Финальный результат содержит статистику по выбранным узлам
+        - 🔍 Каждый вызов функции с node_id записывается в историю
+    2. **Режим датасета**
+        - Загрузка датасета с целевыми словами и путями до текстовых файлов из корпуса
+        - Подгрузить стартовые узлы и настроить количество процессов и стартовых узлов из начала списка
+        - Две возможности: обработка выбранного слова и батч-обработка
+        - При выборе слова: выбор текста, если доступно несколько
+        - В батч-режиме: настроить диапазон примеров, размер батча и тип параллелизма
+        - Три типа параллелизма: по текстам (1 текст = 1 значение слова), по стартовым узлам (если они загружены) и стандартный (сэмплинг)
     
     **Параметры пайплайна:**
-    - **Переранжирование** - включает дополнительную обработку результатов
+    - **Переранжирование** - сокращение числа синсетов с учётом релевантности к целевому слову
+    - **Семантический анализ** - извлечение значения из текста для контекстуализированного переранжирования
     - **Функции** - выберите доступные функции для модели (get_hyponyms, get_hypernyms)
     
     **Возможные результаты:**
@@ -609,98 +792,151 @@ with gr.Blocks(title="RuWordNet Taxonomy Prediction Client", theme=gr.themes.Sof
     """)
     
     # Function to run 3 parallel processes using threads
-    def run_parallel_analysis(text, max_iterations, temperature, top_p, reranking, functions, output_file=None):
-        """Run 3 parallel analysis processes using threads"""
+    def run_parallel_analysis(target_word, texts, max_iterations, temperature, top_p, reranking, interpreting, functions, 
+                         output_file, num_processes, start_nodes_path, max_n_starting_nodes, parallel_mode):
+        """Run analysis with configurable number of processes"""
         
-        # Generate unique output files for each process if base file is provided
-        output_files = [None, None, None]
+        # Загружаем стартовые узлы если указан файл и количество узлов > 0
+        start_nodes_dict = {}
+        if start_nodes_path and max_n_starting_nodes > 0:
+            start_nodes_dict = load_start_nodes(start_nodes_path)
+        
+        # Извлекаем целевое слово из текста
+        if not target_word:
+            match = re.search(r'<predict_kb>(.*?)</predict_kb>', texts[0])
+            target_word = match.group(1).strip() if match else None
+        
+        # Получаем стартовые узлы для целевого слова
+        word_start_nodes = []
+        if target_word and target_word in start_nodes_dict and max_n_starting_nodes > 0:
+            word_start_nodes = start_nodes_dict[target_word][:max_n_starting_nodes]
+        elif max_n_starting_nodes > 0:
+            logger.warning(f'Word {target_word} not found in start nodes list ({list(start_nodes_dict.keys())[0]},...)')
+        
+        # Подготавливаем тексты/узлы для каждого процесса
+        process_data = []
+        for i in range(num_processes):
+            if parallel_mode == 'по текстам' and i < len(texts):
+                text = texts[i]
+            else:
+                text = texts[0]
+            if word_start_nodes:
+                # Используем предзаданный стартовый узел
+                if parallel_mode == 'по стартовым узлам' and i < len(word_start_nodes):
+                    start_node = word_start_nodes[i]
+                else:
+                    start_node = word_start_nodes[0]
+                process_data.append({
+                    'text': text,
+                    'start_node_id': start_node,
+                    'process_id': i + 1
+                })
+            else:
+                # Стандартный режим без предзаданного узла
+                process_data.append({
+                    'text': text,
+                    'process_id': i + 1
+                })
+        
+        # Генерируем уникальные файлы для отслеживания
+        output_files = [None] * num_processes
+        timestamp = int(time.time())
         if output_file:
-            timestamp = int(time.time())
             base_name = output_file.rsplit('.', 1)[0] if '.' in output_file else output_file
             extension = output_file.rsplit('.', 1)[1] if '.' in output_file else 'json'
-            for i in range(3):
+            for i in range(num_processes):
                 output_files[i] = f"{base_name}_process{i+1}_{timestamp}.{extension}"
+        else:
+            for i in range(num_processes):
+                output_files[i] = f"tracking_results/single_word_process{i+1}_{timestamp}.json"
         
-        # Queues to communicate between threads
-        queues = [Queue(), Queue(), Queue()]
+        # Создаем очереди для каждого активного процесса
+        queues = [Queue() for _ in range(num_processes)]
         
-        def run_stream(queue_idx, text, max_iterations, temperature, top_p, reranking, functions, output_file):
-            """Run streaming in a thread and put results in queue"""
+        def run_stream_with_start_node(queue_idx, proc_data, max_iterations, temperature, top_p, 
+                                    reranking, interpreting, functions, output_file):
+            """Run streaming in a thread with optional start node"""
+            start_node_id = proc_data.get('start_node_id')
+            request_args = [proc_data['text'], max_iterations, temperature, top_p, reranking, interpreting, functions, output_file]
+            if start_node_id:
+                request_args.append(start_node_id)
             try:
-                for process_log, final_result in process_text_stream(
-                    text, max_iterations, temperature, top_p, reranking, functions, output_file
-                ):
+                for process_log, final_result in process_text_stream(*request_args):
                     queues[queue_idx].put((process_log, final_result))
             except Exception as e:
-                queues[queue_idx].put((f"❌ Ошибка в потоке: {str(e)}", ""))
+                queues[queue_idx].put((f"❌ Ошибка в процессе #{proc_data['process_id']}: {str(e)}", ""))
             finally:
-                # Signal completion
                 queues[queue_idx].put(None)
         
-        # Start 3 threads
+        # Запускаем потоки
         threads = []
-        for i in range(3):
+        for i in range(num_processes):
             thread = threading.Thread(
-                target=run_stream,
-                args=(i, text, max_iterations, temperature, top_p, reranking, functions, output_files[i])
+                target=run_stream_with_start_node,
+                args=(i, process_data[i], max_iterations, temperature, top_p, reranking, interpreting, functions, output_files[i])
             )
             thread.daemon = True
             thread.start()
             threads.append(thread)
         
-        # Track state for each process
-        active = [True, True, True]
-        results = [("🔵 Запуск процесса #1...", ""), ("🟢 Запуск процесса #2...", ""), ("🟡 Запуск процесса #3...", "")]
+        # Инициализируем результаты для всех 3 выходов
+        results = [
+            (f"🔵 Процесс #1 {'(стартовый узел: ' + process_data[0].get('start_node_id', 'нет') + ')' if len(process_data) > 0 else ''}", "") if num_processes >= 1 else ("Процесс отключен", ""),
+            (f"🟢 Процесс #2 {'(стартовый узел: ' + process_data[1].get('start_node_id', 'нет') + ')' if len(process_data) > 1 else ''}", "") if num_processes >= 2 else ("Процесс отключен", ""),
+            (f"🟡 Процесс #3 {'(стартовый узел: ' + process_data[2].get('start_node_id', 'нет') + ')' if len(process_data) > 2 else ''}", "") if num_processes >= 3 else ("Процесс отключен", "")
+        ]
         
-        # Continuously check queues and yield updates
-        while any(active):
-            updated = False
-            
-            for i in range(3):
+        active = [i < num_processes for i in range(3)]
+        
+        # Обновление результатов из очередей
+        while any(active[:num_processes]):
+            for i in range(num_processes):
                 if active[i]:
                     try:
-                        # Try to get item without blocking
                         while not queues[i].empty():
                             item = queues[i].get_nowait()
                             if item is None:
                                 active[i] = False
                             else:
                                 results[i] = item
-                                updated = True
                     except:
                         pass
             
-            # Yield current state (even if not updated to keep UI responsive)
             yield (results[0][0], results[0][1],
-                   results[1][0], results[1][1],
-                   results[2][0], results[2][1])
+                results[1][0], results[1][1],
+                results[2][0], results[2][1])
             
-            # Small sleep to prevent busy waiting but keep responsive
             time.sleep(0.05)
         
-        # Final yield to ensure all results are shown
+        # Финальный результат
         yield (results[0][0], results[0][1],
-               results[1][0], results[1][1],
-               results[2][0], results[2][1])
-    
+            results[1][0], results[1][1],
+            results[2][0], results[2][1])
+        
+    def run_manual_parallel_analysis(*args):
+        if not isinstance(args[1], list):
+            args[1] = [args[1]]
+        return run_parallel_analysis(*args)
+
     # Event handlers
     manual_run_btn.click(
-        fn=run_parallel_analysis,
-        inputs=[text_input, max_iterations, temperature, top_p, reranking, functions, manual_output_file],
+        fn=run_manual_parallel_analysis,
+        inputs=[word_dropdown, text_input, max_iterations, temperature, top_p, reranking, interpreting, functions, 
+                manual_output_file, num_processes, start_nodes_folder, max_n_starting_nodes],
         outputs=[process_output_1, result_output_1,
-                 process_output_2, result_output_2,
-                 process_output_3, result_output_3]
+                process_output_2, result_output_2,
+                process_output_3, result_output_3]
     )
     
     start_nodes_folder.change(
         fn=get_start_nodes_info,
         inputs=[start_nodes_folder],
-        outputs=[start_nodes_info]
+        outputs=[start_nodes_info, max_n_starting_nodes, parallel_mode]
     )
     # Обновление слайдера максимального количества примеров
     def safe_get_dataset_info(file):
         if not file:
-            return "Файл не выбран", gr.update(choices=[]), 1
+            return "Файл не выбран", gr.update(choices=[]), 1, 1, 1
         
         file_path = file.name if hasattr(file, 'name') else str(file)
         return get_dataset_info(file_path)
@@ -708,22 +944,50 @@ with gr.Blocks(title="RuWordNet Taxonomy Prediction Client", theme=gr.themes.Sof
     dataset_file.change(
         fn=safe_get_dataset_info,
         inputs=[dataset_file],
-        outputs=[dataset_info, word_dropdown, num_samples]
+        outputs=[dataset_info, word_dropdown, sample_start, num_samples, dataset_size]
+    )
+    sample_start.change(
+        fn=lambda x, y: gr.update(maximum=y-x+1, value=y-x+1, interactive=True),
+        inputs=[sample_start, dataset_size],
+        outputs=[num_samples]
     )
     # Автозагрузка текста при выборе слова
     word_dropdown.change(
-        fn=lambda word, corpus: load_word_text_from_corpus(corpus, word),
-        inputs=[word_dropdown, corpus_folder],
-        outputs=[word_text_display]
+        fn=lambda dataset_path, corpus, word: load_word_text_from_corpus(dataset_path, corpus, word),
+        inputs=[dataset_file, corpus_folder, word_dropdown],
+        outputs=[word_text_display, prev_text_btn, current_text_label, next_text_btn]
+    )
+    # Выбор текста
+    prev_text_btn.click(
+        fn=lambda dataset_path, corpus, word, index: load_word_text_from_corpus(dataset_path, corpus, word, int(index) - 2),
+        inputs=[dataset_file, corpus_folder, word_dropdown, current_text_label],
+        outputs=[word_text_display, prev_text_btn, current_text_label, next_text_btn]
+    )
+    next_text_btn.click(
+        fn=lambda dataset_path, corpus, word, index: load_word_text_from_corpus(dataset_path, corpus, word, int(index)),
+        inputs=[dataset_file, corpus_folder, word_dropdown, current_text_label],
+        outputs=[word_text_display, prev_text_btn, current_text_label, next_text_btn]
+    )
+    reranking.change(
+        fn=lambda x: gr.update(interactive=False) if not x else gr.update(interactive=True),
+        inputs=[reranking],
+        outputs=[interpreting]
     )
     # Режим выбранного слова
     dataset_run_btn.click(
         fn=process_dataset_item,
-        inputs=[dataset_file, corpus_folder, word_dropdown, max_iterations, temperature, top_p, reranking, functions],
-        outputs=[process_output_1, result_output_1]
+        inputs=[
+            dataset_file, corpus_folder, word_dropdown, max_iterations,
+            temperature, top_p, reranking, interpreting, functions,
+            num_processes, start_nodes_folder, max_n_starting_nodes,
+            parallel_mode, dataset_output_file
+        ],
+        outputs=[process_output_1, result_output_1,
+                process_output_2, result_output_2,
+                process_output_3, result_output_3]
     )
     word_dropdown.change(
-        fn=lambda dataset_file, query: search_words_in_dataset(dataset_file.name if dataset_file else "", query) if query else gr.update(),
+        fn=lambda dataset_file, query: search_words_in_dataset(dataset_file.name if dataset_file else "", query) if query else query.upper(),
         inputs=[dataset_file, word_dropdown],
         outputs=[word_dropdown]
     )
@@ -737,16 +1001,16 @@ with gr.Blocks(title="RuWordNet Taxonomy Prediction Client", theme=gr.themes.Sof
     
     # Загрузка текста при валидном выборе слова
     word_dropdown.select(
-        fn=lambda word, corpus: load_word_text_from_corpus(corpus, word),
-        inputs=[word_dropdown, corpus_folder],
-        outputs=[word_text_display]
+        fn=lambda dataset_path, corpus, word: load_word_text_from_corpus(dataset_path, corpus, word),
+        inputs=[dataset_file, corpus_folder, word_dropdown],
+        outputs=[word_text_display, prev_text_btn, current_text_label, next_text_btn]
     )
     
     # Батч-обработка с учетом max_samples
     batch_run_btn.click(
         fn=process_dataset_batch,
-        inputs=[dataset_file, corpus_folder, num_samples, batch_size, max_iterations, 
-                temperature, top_p, reranking, functions],
+        inputs=[dataset_file, corpus_folder, sample_start, num_samples, num_processes, batch_size, max_iterations, 
+                temperature, top_p, reranking, interpreting, functions, start_nodes_folder, max_n_starting_nodes, parallel_mode],
         outputs=[batch_results]
     )
     
