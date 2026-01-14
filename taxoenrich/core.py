@@ -2,9 +2,10 @@ import os
 import codecs
 import json
 from tqdm import tqdm
-import pymorphy2
+import pymorphy3
 import xml.etree.ElementTree as ET
 import codecs
+import networkx as nx
 
 class SynSet:
     def __init__(self, synset_id, synset_name, synset_type, words, synset_names_all=[], definition=None):
@@ -218,6 +219,26 @@ class RuWordNet(WordNet):
     def _load_wordnet(self, wordnet_root):
         self._load_synsets(wordnet_root)
         self._load_rels(wordnet_root)
+        self._build_graph()
+
+    def _build_graph(self):
+        G = nx.DiGraph()
+        for synset in self.synsets.values():
+            _id = synset.synset_id
+            G.add_node(_id)
+            hyponyms = synset.rels.get('hyponym', [])
+
+            for hypo_id in hyponyms:
+                G.add_node(hypo_id)
+                G.add_edge(_id, hypo_id)
+
+        self.graph = G
+
+    def find_generation(self, synset_id):
+        for i, gen in enumerate(nx.topological_generations(self.graph)):
+            if synset_id in gen:
+                return i
+        return -1
 
     def _load_synsets(self, wordnet_root, black_list_synsets=None, black_list_senses=None):
         synsets_paths = {
@@ -226,7 +247,7 @@ class RuWordNet(WordNet):
             'V': os.path.join(wordnet_root, 'synsets.V.xml')
         }
 
-        morph_analizer = pymorphy2.MorphAnalyzer()
+        morph_analizer = pymorphy3.MorphAnalyzer()
         for synset_type, synset_path in synsets_paths.items():
             root = ET.parse(synset_path).getroot()
             for synset in list(root):
@@ -245,7 +266,7 @@ class RuWordNet(WordNet):
                 for sense in list(synset):
                     word = sense.text.lower().replace('ё', 'е')
                     split_word = word.split()
-                    split_word = [morph_analizer.parse(w)[0].normal_form.replace('ё', 'е') for w in split_word]
+                    #split_word = [morph_analizer.parse(w)[0].normal_form.replace('ё', 'е') for w in split_word]
                     sense = '_'.join(split_word)
                     if black_list_senses is not None and sense in black_list_senses:
                         continue
@@ -334,6 +355,7 @@ class RuWordNet(WordNet):
                         'name': synset.synset_name,
                         'words': [w.replace('_', ' ') for w in synset.synset_words],
                         'id': synset.synset_id,
+                        'hypernyms': [],
                         'hyponyms': hyponym_names,
                         'definition': synset.definition
                     })
@@ -353,6 +375,12 @@ class RuWordNet(WordNet):
                     if pos is not None and hypo_synset.synset_type != pos:
                         continue
                     
+                    # Get hypernym names for this hyponym
+                    hypernym_names = []
+                    for super_hyper_id in hypo_synset.rels.get('hypernym', []):
+                        if super_hyper_id in self.synsets:
+                            hypernym_names.append(self.synsets[super_hyper_id].synset_name)
+
                     # Get hyponym names for this hyponym
                     hyponym_names = []
                     for sub_hypo_id in hypo_synset.rels.get('hyponym', []):
@@ -364,9 +392,50 @@ class RuWordNet(WordNet):
                         'name': hypo_synset.synset_name,
                         'words': [w.replace('_', ' ') for w in hypo_synset.synset_words],
                         'id': hypo_synset.synset_id,
+                        'hypernyms': hypernym_names,
                         'hyponyms': hyponym_names,
                         'definition': hypo_synset.definition
                     })
+        
+        return result
+    
+    def get_hypernyms(self, synset_id=None, pos=None):
+        result = []
+        if synset_id not in self.synsets:
+            return []  # Synset not found
+        
+        synset = self.synsets[synset_id]
+        hypernym_ids = synset.rels.get('hypernym', [])
+        
+        for hyper_id in hypernym_ids:
+            if hyper_id in self.synsets:
+                hyper_synset = self.synsets[hyper_id]
+                
+                # Filter by POS if specified
+                if pos is not None and hyper_synset.synset_type != pos:
+                    continue
+                
+                # Get hypernym names for this hypernym
+                hypernym_names = []
+                for super_hyper_id in hyper_synset.rels.get('hypernym', []):
+                    if super_hyper_id in self.synsets:
+                        hypernym_names.append(self.synsets[super_hyper_id].synset_name)
+
+                # Get hyponym names for this hyponym
+                hyponym_names = []
+                for sub_hypo_id in hyper_synset.rels.get('hyponym', []):
+                    if sub_hypo_id in self.synsets:
+                        hyponym_names.append(self.synsets[sub_hypo_id].synset_name)
+                
+                #hyponym_names = hyponym_names[:10] + ['...']
+                result.append({
+                    'name': hyper_synset.synset_name,
+                    'words': [w.replace('_', ' ') for w in hyper_synset.synset_words],
+                    'id': hyper_synset.synset_id,
+                    'hypernyms': hypernym_names,
+                    'hyponyms': hyponym_names,
+                    'definition': hyper_synset.definition
+                })
         
         return result
 
