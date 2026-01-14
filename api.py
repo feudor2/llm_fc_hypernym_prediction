@@ -2,15 +2,17 @@ import json
 import os
 import re
 import asyncio
+import httpx
 import logging
 
 from datetime import datetime
+from math import log2
 from pprint import pformat
 from typing import AsyncGenerator, Optional
 from dotenv import load_dotenv
 
 from pydantic import BaseModel
-from openai import OpenAI
+from openai import AsyncOpenAI
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 
@@ -19,6 +21,7 @@ from utils import *
 from io_utils import read_yaml
 from tools import tools as available_tools_config
 from reranker import Reranker, RerankerRequest
+from interpreter import Interpreter, InterpreterRequest
 from data_processing import prepare_target
 
 load_dotenv()
@@ -30,7 +33,7 @@ app = FastAPI(title="RuWordNet Taxonomy Prediction API")
 wordnet = RuWordNet('./wordnets/RuWordNet')
 
 # Initialize OpenAI client
-oclient = OpenAI(api_key=os.environ['API_KEY'], base_url=os.environ['BASE_URL'])
+oclient = AsyncOpenAI(api_key=os.environ['API_KEY'], base_url=os.environ['BASE_URL'])
 
 # Initialize logging
 log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -46,7 +49,10 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# Инициализация реранкера и интерпретатора
 reranker = Reranker(oclient, os.environ['MODEL_NAME'], logger)
+interpreter = Interpreter(oclient, os.environ['MODEL_NAME'], logger)
 
 
 # Глобальная структура для отслеживания выбранных синсетов
@@ -68,9 +74,6 @@ class SynsetTracker:
         """Установить целевое слово"""
         self.target_word = target
 
-    def set_final_synset(self, final_synset: Optional[str]):
-        if final_synset:
-            self.selected_synsets.append(final_synset)
     
     def clear(self):
         """Очистить трекер"""
@@ -93,8 +96,10 @@ class PredictionRequest(BaseModel):
     temperature: float = 0.5
     top_p: float = 0.95
     reranking: bool = False
+    interpreting: bool = False
     functions: list = ["get_hyponyms"]
-    output_file: str = None  # Новый параметр для сохранения результатов
+    output_file: str = None
+    start_node_id: str = None  # Новый параметр для стартового узла
 
 class PredictionResponse(BaseModel):
     result: str
@@ -113,12 +118,54 @@ def get_synset_id_from_response(text: str) -> str:
     match = re.findall(r'\d{1,6}-[ANV]', text)
     return match[-1] if match else None
 
+async def prepare_start_user_message(text: str, start_node_id: str = None, reranking: bool = False, sense: Optional[str] = None, tracker: Optional[SynsetTracker] = None) -> str:
+    """Prepare user message with optional start node context"""
+    if not start_node_id:
+        return text
+    
+    # Получаем информацию о стартовом узле
+    try:
+        synset = wordnet.synsets.get(start_node_id)
+        if not synset:
+            logger.warning(f'Стартовый узел {start_node_id} не найден.')
+            return text  # Fallback к оригинальному тексту
+        
+        synset_name = synset.synset_name
+        synset_words = "; ".join(list(synset.synset_words)[:5])
+        
+        # Получаем гипонимы и гиперонимы
+        hyponyms_info = await get_hyponyms(start_node_id, reranking=reranking, sense=sense, tracker=tracker)
+        hypernyms_info = await get_hypernyms(start_node_id, reranking=False, sense=sense, tracker=tracker)
+        
+        # Формируем расширенное сообщение
+        enhanced_message = f"""Дан стартовый узел для анализа:
 
-async def get_hyponyms(node_id, reranking=False, threshold=0, tracker: SynsetTracker = None):
+**Стартовый синсет:** {synset_name} `{start_node_id}`
+**Слова синсета:** {synset_words}
+
+**Релевантные гипонимы**:
+{hyponyms_info}
+
+**Гиперонимы**:
+{hypernyms_info}
+
+**Контекст со словом для анализа**:
+
+{text}
+
+Начни анализ с этого узла и определи, куда лучше поместить целевое понятие. Ты можешь двигаться вниз по таксономии или вверх в зависимости от доступных функций. Если стартовый узел совсем не подходит по контексту, начни движение с корневых узлов."""
+        
+        return enhanced_message
+        
+    except Exception as e:
+        logger.error(f"Ошибка подготовки сообщения со стартовым узлом: {e}")
+        return text
+
+
+async def get_hyponyms(node_id, reranking=False, sense: Optional[str] = None, context='', threshold=0, tracker: SynsetTracker = None):
     """Tool function for getting hyponyms and formatting as markdown"""
     if node_id == 'null':
         node_id = None
-    
     
     results = wordnet.get_hyponyms(node_id, pos='N')
 
@@ -134,13 +181,14 @@ async def get_hyponyms(node_id, reranking=False, threshold=0, tracker: SynsetTra
             # Адаптивный трешхолд (зависит от глубины понятия)
             gen = wordnet.find_generation(node_id)
             if gen >= 0:
-                threshold = min(gen + 1, 5)
+                threshold = min(log2(gen + 1), 5)
             
             rerank_request = RerankerRequest(
                 target=tracker.target_word,
                 candidates=candidates,
                 threshold=threshold/5.0,
-                rel='hyponym'
+                rel='hyponym',
+                sense=sense
             )
             
             reranked = await reranker(rerank_request)
@@ -155,7 +203,7 @@ async def get_hyponyms(node_id, reranking=False, threshold=0, tracker: SynsetTra
 
     # Отслеживание выбранного синсета
     if tracker and node_id:
-        tracker.add_synset(node_id, "get_hyponyms", {"node_id": node_id, "reranking": reranking, "threshold": threshold})
+        tracker.add_synset(node_id, "get_hyponyms", {"node_id": node_id, "reranking": reranking, "interpreting": sense, "threshold": threshold})
     
     markdown = f"**Найдено гипонимов: {len(results)}**\n"
     
@@ -184,19 +232,46 @@ async def get_hyponyms(node_id, reranking=False, threshold=0, tracker: SynsetTra
     return markdown
 
 
-async def get_hypernyms(node_id, tracker: SynsetTracker = None):
+async def get_hypernyms(node_id, reranking=False, sense: Optional[str] = None, context='', threshold=0, tracker: SynsetTracker = None):
     """Tool function for getting hypernyms and formatting as markdown"""
     if node_id == 'null':
         node_id = None
-    
-    # Отслеживание выбранного синсета
-    if tracker and node_id:
-        tracker.add_synset(node_id, "get_hypernyms", {"node_id": node_id})
     
     results = wordnet.get_hypernyms(node_id, pos='N')
 
     if not results:
         return "Гиперонимов не найдено."
+    
+    if reranking and results and tracker and tracker.target_word:
+        try:
+            candidates = tuple(item['name'] for item in results)
+
+            # Адаптивный трешхолд (зависит от глубины понятия)
+            gen = wordnet.find_generation(node_id)
+            if gen >= 0:
+                threshold = min(log2(gen + 1), 5)
+            
+            rerank_request = RerankerRequest(
+                target=tracker.target_word,
+                candidates=candidates,
+                threshold=threshold/5.0,
+                rel='hyponym',
+                sense=sense
+            )
+            
+            reranked = await reranker(rerank_request)
+            
+            reranked_names = {item['candidate'] for item in reranked}
+            results = [item for item in results if item['name'] in reranked_names]
+            
+            logger.info(f"Реранкинг для '{tracker.target_word}' сократил результаты с {len(candidates)} до {len(results)}")
+            
+        except Exception as e:
+            logger.error(f"Ошибка реранкинга: {e}")
+
+    # Отслеживание выбранного синсета
+    if tracker and node_id:
+        tracker.add_synset(node_id, "get_hypernyms", {"node_id": node_id})
     
     markdown = f"**Найдено гиперонимов: {len(results)}**\n"
     
@@ -269,21 +344,29 @@ available_tools = {
 }
 
     
-async def process_prediction(text: str, max_iterations: int, temperature: float, top_p: float, 
-                      reranking: bool, functions: list, output_file: str = None):
-    """Process prediction without streaming"""
+async def process_prediction(text: str, max_iterations: int, temperature: float, top_p: float,
+                                   reranking: bool, interpreting: bool, functions: list, output_file: str = None, 
+                                   start_node_id: str = None):
+    """Process prediction without streaming and optional start node"""
     
-    # Создаем трекер для отслеживания выбранных синсетов
     tracker = SynsetTracker()
     tracker.set_target(extract_target_word(text))
+    
+    # Подготавливаем пользовательское сообщение с учетом стартового узла
+    sense = await interpreter(InterpreterRequest(context=text)) if interpreting else None
+    user_message = await prepare_start_user_message(text, start_node_id, reranking=reranking, sense=sense, tracker=tracker)
     
     system_prompt = get_system_prompt(functions)
     
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": text},
+        {"role": "user", "content": user_message},
     ]
     
+    # Если есть стартовый узел, добавляем его в трекер
+    if start_node_id:
+        tracker.add_synset(start_node_id, "start_node", {"node_id": start_node_id})
+
     # Получить правильный набор инструментов из tools.py
     if set(functions) == {"get_hyponyms"}:
         filtered_tools = available_tools_config['hyponym_only']
@@ -300,7 +383,7 @@ async def process_prediction(text: str, max_iterations: int, temperature: float,
         iteration_count = i + 1
         
         try:
-            response_obj = oclient.chat.completions.create(
+            response_obj = await oclient.chat.completions.create(
                 model=os.environ['MODEL_NAME'],
                 messages=messages,
                 tools=filtered_tools,
@@ -318,6 +401,7 @@ async def process_prediction(text: str, max_iterations: int, temperature: float,
         if not response_message.tool_calls:
             final_result = response_message.content.strip()
             final_synset = get_synset_id_from_response(final_result)
+            logger.info(f'Извлечён id синсета из финального результата: {final_synset}')
             break
         
         # Process tool calls
@@ -333,7 +417,12 @@ async def process_prediction(text: str, max_iterations: int, temperature: float,
             
             # Передаем трекер в функцию
             if function_name in ["get_hyponyms", "get_hypernyms"]:
-                function_args['tracker'] = tracker
+                function_args.update({
+                    'tracker': tracker,
+                    'reranking': reranking,
+                    'sense': sense,
+                    'context': text
+                })
             
             function_response = await function_to_call(**function_args)
             
@@ -349,7 +438,8 @@ async def process_prediction(text: str, max_iterations: int, temperature: float,
         final_result = "Достигнут лимит итераций"
     
     # Получаем данные отслеживания
-    tracker.set_final_synset(final_synset)
+    if final_synset:
+        tracker.add_synset(final_synset, "final_result", {"node_id": final_synset, "interpreting": sense, "reranking": reranking})
     tracking_data = tracker.get_tracking_data()
     tracking_data['final_result'] = final_result
     tracking_data['iterations'] = iteration_count
@@ -368,21 +458,22 @@ async def process_prediction(text: str, max_iterations: int, temperature: float,
 
 
 async def process_prediction_stream(text: str, max_iterations: int, temperature: float, top_p: float,
-                                   reranking: bool, functions: list, output_file: str = None) -> AsyncGenerator[str, None]:
-    """Process prediction with streaming"""
+                                   reranking: bool, interpreting: bool, functions: list, output_file: str = None, 
+                                   start_node_id: str = None) -> AsyncGenerator[str, None]:
+    """Process prediction with streaming and optional start node"""
     
-    # Создаем трекер для отслеживания выбранных синсетов
     tracker = SynsetTracker()
     tracker.set_target(extract_target_word(text))
     
-    logger.info(f"Pipeline parameters - reranking: {reranking}, functions: {functions}")
-    logger.info(f"Target word: {tracker.target_word}")
+    # Подготавливаем пользовательское сообщение с учетом стартового узла
+    sense = await interpreter(InterpreterRequest(context=text)) if interpreting else None
+    user_message = await prepare_start_user_message(text, start_node_id, reranking=reranking, sense=sense, tracker=tracker)
     
     system_prompt = get_system_prompt(functions)
     
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": text},
+        {"role": "user", "content": user_message},
     ]
     
     # Фильтруем доступные инструменты согласно параметрам
@@ -397,7 +488,7 @@ async def process_prediction_stream(text: str, max_iterations: int, temperature:
         yield f"data: {json.dumps({'type': 'iteration', 'iteration': i + 1}, ensure_ascii=False)}\n\n"
         
         try:
-            response_obj = oclient.chat.completions.create(
+            response_obj = await oclient.chat.completions.create(
                 model=os.environ['MODEL_NAME'],
                 messages=messages,
                 tools=filtered_tools,
@@ -420,8 +511,12 @@ async def process_prediction_stream(text: str, max_iterations: int, temperature:
         # Check if this is the final response
         if not response_message.tool_calls:
             final_result = response_message.content.strip()
+            final_synset = get_synset_id_from_response(final_result)
+            logger.info(f'Извлечён id синсета из финального результата: {final_synset}')
             
             # Получаем данные отслеживания
+            if final_synset:
+                tracker.add_synset(final_synset, "final_result", {"node_id": final_synset, "reranking": reranking})
             tracking_data = tracker.get_tracking_data()
             tracking_data['final_result'] = final_result
             tracking_data['iterations'] = i + 1
@@ -456,8 +551,12 @@ async def process_prediction_stream(text: str, max_iterations: int, temperature:
             
             # Передаем трекер в функцию
             if function_name in ["get_hyponyms", "get_hypernyms"]:
-                function_args['tracker'] = tracker
-                function_args['reranking'] = reranking
+                function_args.update({
+                    'tracker': tracker,
+                    'reranking': reranking,
+                    'sense': sense,
+                    'context': text
+                })
             
             function_response = await function_to_call(**function_args)
             
@@ -488,7 +587,9 @@ async def predict(request: PredictionRequest):
         temperature=request.temperature,
         top_p=request.top_p,
         reranking=request.reranking,
+        interpreting=request.interpreting,
         functions=request.functions,
+        start_node_id=request.start_node_id,
         output_file=request.output_file
     )
     
@@ -510,11 +611,15 @@ async def predict_stream(request: PredictionRequest):
             temperature=request.temperature,
             top_p=request.top_p,
             reranking=request.reranking,
+            interpreting=request.interpreting,
             functions=request.functions,
+            start_node_id=request.start_node_id,
             output_file=request.output_file
         ),
         media_type="text/event-stream"
     )
+
+
 
 
 @app.get("/health")
