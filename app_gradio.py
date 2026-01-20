@@ -793,7 +793,7 @@ with gr.Blocks(title="RuWordNet Taxonomy Prediction Client", theme=gr.themes.Sof
     
     # Function to run 3 parallel processes using threads
     def run_parallel_analysis(target_word, texts, max_iterations, temperature, top_p, reranking, interpreting, functions, 
-                         output_file, num_processes, start_nodes_path, max_n_starting_nodes, parallel_mode):
+                         output_file, num_processes, start_nodes_path, max_n_starting_nodes, parallel_mode=None):
         """Run analysis with configurable number of processes"""
         
         # Загружаем стартовые узлы если указан файл и количество узлов > 0
@@ -915,8 +915,10 @@ with gr.Blocks(title="RuWordNet Taxonomy Prediction Client", theme=gr.themes.Sof
         
     def run_manual_parallel_analysis(*args):
         if not isinstance(args[1], list):
+            args = list(args)
             args[1] = [args[1]]
-        return run_parallel_analysis(*args)
+        for results in run_parallel_analysis(*args):
+            yield results
 
     # Event handlers
     manual_run_btn.click(
