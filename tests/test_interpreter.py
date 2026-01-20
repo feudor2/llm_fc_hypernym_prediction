@@ -23,7 +23,7 @@ oclient = AsyncOpenAI(api_key=os.environ['API_KEY'], base_url=os.environ['BASE_U
 
 # Initialize logging
 log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-log_dir = '././logs'
+log_dir = 'logs'
 
 logging.basicConfig(
     level=logging.INFO,
@@ -73,13 +73,13 @@ async def run_test(interpreter: Interpreter, requests: list[InterpreterRequest],
 
 
 async def main():
-    dataset_path = '././corpus/private'
+    dataset_path = 'corpus/private'
     contexts = await prepare_dataset(dataset_path, 100)
     interpreter = Interpreter(oclient, model_name=os.environ['MODEL_NAME'], logger=logger)
     requests = [InterpreterRequest(context=pair[1]) for pair in contexts]
     results = await run_test(interpreter, requests, batch_size=10)
     results = pd.DataFrame({'word': [pair[0] for pair in contexts], 'sense': results})
-    results.to_csv('././test_results/interpreter_results.tsv', sep='\t')
+    results.to_csv('test_results/interpreter_results.tsv', sep='\t')
 
 
 if __name__ == "__main__":

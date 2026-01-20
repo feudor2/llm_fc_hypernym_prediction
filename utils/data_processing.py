@@ -9,7 +9,7 @@ from collections import defaultdict
 
 from pymorphy3 import MorphAnalyzer
 #from taxoenrich.data_utils import read_dataset
-from io_utils import aread_json
+from utils.io_utils import aread_json
 
 parser = MorphAnalyzer()
 
@@ -29,7 +29,7 @@ def read_dataset(dataset_path):
 
 def load_dataset(dataset_path):
     """
-    Функция считывает датасет в формате {"word_1": [(["node_id_1_1", "node_id_1_2",...], ["path_1_1", "path_1_2", ...]]), ...]...}
+    Функция считывает датасет в формате {"word_1": [(["node_id_1_1", "node_id_1_2",...], ["path_1_1", "path_1_2", ...]), ...]...}
     где word_i — это целевое слово, для которого нужно предсказать позицию
     node_id_i — узел, подходящий для использования в качестве гиперонима (целевой родительский узел)
     """

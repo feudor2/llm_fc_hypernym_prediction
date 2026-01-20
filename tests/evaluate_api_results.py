@@ -15,7 +15,7 @@ from utils.data_processing import collect_tracking_results, load_start_nodes
 from utils.io_utils import save_json 
 
 
-wordnet = RuWordNet('././wordnets/RuWordNet')
+wordnet = RuWordNet('wordnets/RuWordNet')
 
 def compute_p(true, pred, k=1):
     k = min(k, len(true))
@@ -76,7 +76,7 @@ def select_candidates(candidates: dict[str, list[list[str]]], longest_first: boo
     
 
 async def main(tracking_path: str, start_node: bool):
-    dataset_path = '././test_results/context_analyser_results.tsv'
+    dataset_path = 'test_results/context_analyser_results.tsv'
     dataset = read_dataset(dataset_path, read_fn=lambda x: eval(x))
     #dataset = load_dataset(dataset_path)
     print('Loaded dataset:', list(dataset.items())[0], ', ...')
@@ -85,7 +85,7 @@ async def main(tracking_path: str, start_node: bool):
     print('Loaded results:', *list(results.items())[:1], ', ...')
     selected_words = [word for word, values in results.items() if any(values) and word in dataset]
     #print('Selected words:', selected_words[0], ', ...')
-    yandex_results = load_start_nodes('././examples/fasttext_baseline.json')
+    yandex_results = load_start_nodes('examples/fasttext_baseline.json')
     print('External results:', list(yandex_results.items())[:5])
     candidates = {
         #'longest_first': select_candidates(results, longest_first=True, deepest_first=False),
@@ -103,7 +103,7 @@ async def main(tracking_path: str, start_node: bool):
     }'''
 
     for method, _candidates in candidates.items():
-        save_json(f'././test_results/candidates/{method}.json', _candidates)
+        save_json(f'test_results/candidates/{method}.json', _candidates)
     
     metrics = []
     for method, _candidates in candidates.items():
@@ -152,20 +152,20 @@ async def main(tracking_path: str, start_node: bool):
     grouped = pd.concat([df, grouped_methods], axis=1)
     group = grouped[grouped['group'].str.contains('(mean)')].groupby('group')[['MAP', 'MRR']].mean()
     df = pd.concat([df, group.reset_index().rename(columns={'group': 'method'})]) '''
-    df.to_csv(f'././test_results/metrics/{tracking_path.split("/")[1]}_items.tsv', sep='\t', index=False)
+    df.to_csv(f'test_results/metrics/{tracking_path.split("/")[1]}_items.tsv', sep='\t', index=False)
 
 def process_df(tracking_path):
-    df = pd.read_csv(f'././test_results/metrics/{tracking_path.split("/")[1]}_items.tsv', sep='\t')
+    df = pd.read_csv(f'test_results/metrics/{tracking_path.split("/")[1]}_items.tsv', sep='\t')
     df = df.drop(columns=['word', 'pred', 'true']).groupby('method').mean().reset_index()
     grouped_methods = pd.DataFrame({'group': df['method'].apply(lambda m: re.sub( '\[\d\]', '1 (mean)', m))})
     grouped = pd.concat([df, grouped_methods], axis=1)
     group = grouped[grouped['group'].str.contains('(mean)', regex=False)].groupby('group')[[_metric + f'@{k}' for _metric, k in product(['MAP', 'MRR', 'P'], [1, 3])]].mean()
     df = pd.concat([df, group.reset_index().rename(columns={'group': 'method'})]).round(3)
-    df.to_csv(f'././test_results/metrics/{tracking_path.split("/")[1]}_metrics.tsv', sep='\t', index=False)
+    df.to_csv(f'test_results/metrics/{tracking_path.split("/")[1]}_metrics.tsv', sep='\t', index=False)
 
 
 if __name__ == "__main__":
-    #tracking_path = '././tracking_results/batch_1768282585'
-    tracking_path = '././tracking_results/batch_1768400615'
+    #tracking_path = 'tracking_results/batch_1768282585'
+    tracking_path = 'tracking_results/batch_1768400615'
     asyncio.run(main(tracking_path, start_node=True))
     process_df(tracking_path)

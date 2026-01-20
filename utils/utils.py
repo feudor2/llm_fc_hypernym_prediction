@@ -22,7 +22,7 @@ def read_prompt(prompt_name: str, logger: Optional[Logger] = None) -> str:
     :return: текст промпта
     :rtype: str
     """
-    prompt_dir = '././prompts/'
+    prompt_dir = 'prompts/'
     prompt_path = f'{prompt_dir}{prompt_name}.md'
     if os.path.exists(prompt_path):
         msg = f'Prompt `{prompt_name}` is available.'
@@ -35,7 +35,7 @@ def read_prompt(prompt_name: str, logger: Optional[Logger] = None) -> str:
 
 
 def read_prompts(prefix: str, logger: Optional[Logger] = None) -> Dict[str, str]:
-    prompt_dir = Path('././prompts/')
+    prompt_dir = Path('prompts/')
     prompts = dict()
     for entry in prompt_dir.glob(f'{prefix}*'):
         prompts[entry.stem] = read_prompt(entry.stem)

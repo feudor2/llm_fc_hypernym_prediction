@@ -24,7 +24,7 @@ oclient = AsyncOpenAI(api_key=os.environ['API_KEY'], base_url=os.environ['BASE_U
 
 # Initialize logging
 log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-log_dir = '././logs'
+log_dir = 'logs'
 
 logging.basicConfig(
     level=logging.INFO,
@@ -120,9 +120,9 @@ async def rebuild_dataset(tracker: SenseTracker, senses: Dict[str, List[Tuple[Li
     return pd.DataFrame(output)
 
 async def main():
-    corpus_path = '././corpus/annotated_texts'
+    corpus_path = 'corpus/annotated_texts'
     corpus = await prepare_corpus(corpus_path, n_texts=10)
-    dataset_path = '././datasets/nouns_private_subgraphs.tsv'
+    dataset_path = 'datasets/nouns_private_subgraphs.tsv'
     senses = await prepare_senses(dataset_path)
     tracker = SenseTracker(senses)
     context_analyser = ContextAnalyser(oclient, model_name=os.environ['MODEL_NAME'], logger=logger)
@@ -135,7 +135,7 @@ async def main():
         tracker.register(results, contexts)
 
     results = await rebuild_dataset(tracker=tracker, senses=senses)
-    results.to_csv('././test_results/context_analyser_results.tsv', sep='\t', header=None, index=False)
+    results.to_csv('test_results/context_analyser_results.tsv', sep='\t', header=None, index=False)
 
 
 if __name__ == "__main__":

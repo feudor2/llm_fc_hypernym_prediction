@@ -27,14 +27,14 @@ load_dotenv()
 app = FastAPI(title="RuWordNet Taxonomy Prediction API")
 
 # Initialize RuWordNet
-wordnet = RuWordNet('././wordnets/RuWordNet')
+wordnet = RuWordNet('wordnets/RuWordNet')
 
 # Initialize OpenAI client
 oclient = AsyncOpenAI(api_key=os.environ['API_KEY'], base_url=os.environ['BASE_URL'])
 
 # Initialize logging
 log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-log_dir = '././logs'
+log_dir = 'logs'
 os.makedirs(log_dir, exist_ok=True)
 
 logging.basicConfig(

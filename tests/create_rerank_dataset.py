@@ -12,7 +12,7 @@ from taxoenrich.data_utils import read_dataset
 from utils.io_utils import save_json
 
 # Initialize RuWordNet
-wordnet = RuWordNet('././wordnets/RuWordNet')
+wordnet = RuWordNet('wordnets/RuWordNet')
 all_nodes = [sid for sid, synset in wordnet.synsets.items() if synset.synset_type == 'N']
 
 
@@ -78,7 +78,7 @@ def main(dataset_path: str):
     dataset = read_dataset(dataset_path, read_fn=json.loads)
     results = {word: create_sample(nodes[0], max_nodes_cat=3) for word, nodes in tqdm(dataset.items())}
 
-    save_json('././datasets/reranker.json', results)
+    save_json('datasets/reranker.json', results)
 
 if __name__ == '__main__':
     Fire(main)

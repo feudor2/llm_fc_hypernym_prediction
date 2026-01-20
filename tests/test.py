@@ -1,6 +1,6 @@
 from taxoenrich.core import RuWordNet
 
-wordnet = RuWordNet('././wordnets/RuWordNet')
+wordnet = RuWordNet('wordnets/RuWordNet')
 
 import json
 from openai import OpenAI

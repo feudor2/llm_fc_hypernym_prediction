@@ -25,11 +25,11 @@ load_dotenv()
 oclient = OpenAI(api_key=os.environ['API_KEY'], base_url=os.environ['BASE_URL'])
 
 # Initialize RuWordNet
-wordnet = RuWordNet('././wordnets/RuWordNet')
+wordnet = RuWordNet('wordnets/RuWordNet')
 
 # Initialize logging
 log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-log_dir = '././logs'
+log_dir = 'logs'
 
 logging.basicConfig(
     level=logging.INFO,
@@ -102,7 +102,7 @@ async def run_test(reranker: Reranker, requests: list[RerankerRequest], batch_si
 
 
 async def main():
-    dataset_path = '././datasets/reranker.json'
+    dataset_path = 'datasets/reranker.json'
     dataset = await prepare_dataset(dataset_path)
     '''batch_size = 10
     reranker = Reranker(oclient, model_name=os.environ['MODEL_NAME'], logger=logger)
@@ -113,7 +113,7 @@ async def main():
     results = results + await aread_json('test_results/reranker_results.json')
     metrics = evaluate(dataset, results)
     metrics = pd.DataFrame(metrics)
-    metrics.to_csv('././test_results/reranker_metrics.tsv', sep='\t')
+    metrics.to_csv('test_results/reranker_metrics.tsv', sep='\t')
     print(metrics[['ndcg', 'tau', 'r']].mean())
 
 if __name__ == "__main__":

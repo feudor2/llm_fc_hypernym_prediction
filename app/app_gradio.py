@@ -179,7 +179,7 @@ def process_dataset_item(
         # Генерируем имя файла для отслеживания если не указан
         if not output_file:
             timestamp = int(time.time())
-            output_file = f"././tracking_results/single_word_{word}_{timestamp}.json"
+            output_file = f"tracking_results/single_word_{word}_{timestamp}.json"
         
         # Process using the streaming function
         for results in run_parallel_analysis(
@@ -325,7 +325,7 @@ async def process_dataset_batch_async(dataset_file, corpus_folder, sample_start,
                     "reranking": reranking,
                     "interpreting": interpreting,
                     "functions": functions,
-                    "output_file": f"././tracking_results/batch_{start_time}/async_word_{word}_[{task_id}].json"
+                    "output_file": f"tracking_results/batch_{start_time}/async_word_{word}_[{task_id}].json"
                 }
                 
                 # Добавляем стартовый узел если есть
@@ -414,7 +414,7 @@ async def process_dataset_batch_async(dataset_file, corpus_folder, sample_start,
     
     # Сохраняем результаты
     timestamp = int(time.time())
-    output_file = f"././test_results/async_batch_{len(words_to_process)}words_{timestamp}.json"
+    output_file = f"test_results/async_batch_{len(words_to_process)}words_{timestamp}.json"
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
     
     # Группируем результаты по словам
@@ -581,7 +581,7 @@ with gr.Blocks(title="RuWordNet Taxonomy Prediction Client", theme=gr.themes.Sof
         # Output file for tracking
         manual_output_file = gr.Textbox(
             label="💾 Файл для сохранения отслеживания (опционально)",
-            placeholder="././tracking_results/manual_analysis.json",
+            placeholder="tracking_results/manual_analysis.json",
             info="Если не указан, будет создан автоматически"
         )
 
@@ -596,14 +596,14 @@ with gr.Blocks(title="RuWordNet Taxonomy Prediction Client", theme=gr.themes.Sof
             )
             corpus_folder = gr.Textbox(
                 label="📂 Папка с корпусом текстов",
-                value="././corpus/annotated_texts",
+                value="corpus/annotated_texts",
                 interactive=True
             )
         
         # Папка стартовых узлов
         start_nodes_folder = gr.Textbox(
             label="📁 Папка стартовых узлов (JSON)",
-            value="././examples/fasttext_baseline.json",
+            value="examples/fasttext_baseline.json",
             interactive=True
         )
         
@@ -666,7 +666,7 @@ with gr.Blocks(title="RuWordNet Taxonomy Prediction Client", theme=gr.themes.Sof
         # Output file for dataset tracking
         dataset_output_file = gr.Textbox(
             label="💾 Файл для сохранения отслеживания датасета (опционально)",
-            placeholder="././tracking_results/dataset_analysis.json",
+            placeholder="tracking_results/dataset_analysis.json",
             info="Если не указан, будет создан автоматически"
         )
         
@@ -764,7 +764,7 @@ with gr.Blocks(title="RuWordNet Taxonomy Prediction Client", theme=gr.themes.Sof
     **Новые возможности:**
     1. **Отслеживание**
         - 📊 Все выбираемые синсеты автоматически сохраняются
-        - 💾 Результаты сохраняются в JSON файлы в папке `././tracking_results/`
+        - 💾 Результаты сохраняются в JSON файлы в папке `tracking_results/`
         - 📈 Финальный результат содержит статистику по выбранным узлам
         - 🔍 Каждый вызов функции с node_id записывается в историю
     2. **Режим датасета**
@@ -846,7 +846,7 @@ with gr.Blocks(title="RuWordNet Taxonomy Prediction Client", theme=gr.themes.Sof
                 output_files[i] = f"{base_name}_process{i+1}_{timestamp}.{extension}"
         else:
             for i in range(num_processes):
-                output_files[i] = f"././tracking_results/single_word_process{i+1}_{timestamp}.json"
+                output_files[i] = f"tracking_results/single_word_process{i+1}_{timestamp}.json"
         
         # Создаем очереди для каждого активного процесса
         queues = [Queue() for _ in range(num_processes)]
