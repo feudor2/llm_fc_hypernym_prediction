@@ -1,31 +1,26 @@
-import pandas as pd
 import codecs
 import json
-from collections import defaultdict, OrderedDict
-import numpy as np
-from tqdm import tqdm
-import gensim
-from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import f1_score
-from sklearn.model_selection import KFold
 import shutil
 import os
 import sys
 import random
-from functools import lru_cache
-import networkx as nx
-# todo in separate file
+import pandas as pd
+import numpy as np
 
-def read_dataset(data_path, read_fn=lambda x: x, sep='\t'):
-    vocab = defaultdict(list)
-    with codecs.open(data_path, 'r', encoding='utf-8') as f:
-        for line in f:
-            line_split = line.replace("\n", '').split(sep)
-            word = line_split[0].upper()
-            hypernyms = read_fn(line_split[1])
-            vocab[word].append(hypernyms)
-    return vocab
+import gensim
+import networkx as nx
+
+from collections import defaultdict, OrderedDict
+from typing import Dict
+from functools import lru_cache
+
+from tqdm import tqdm
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import f1_score
+from sklearn.model_selection import KFold
+
+from data_utils import read_dataset
 
 
 class StaticVectorModel:
