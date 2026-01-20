@@ -115,7 +115,6 @@ pytz==2025.2
 pywinpty==3.0.2
 PyYAML==6.0.3
 pyzmq==27.1.0
-razdel==0.5.0
 referencing==0.37.0
 requests==2.32.5
 rfc3339-validator==0.1.4
@@ -123,7 +122,6 @@ rfc3986-validator==0.1.1
 rfc3987-syntax==1.1.0
 rich==14.2.0
 rpds-py==0.30.0
-ru_core_news_md @ https://github.com/explosion/spacy-models/releases/download/ru_core_news_md-3.8.0/ru_core_news_md-3.8.0-py3-none-any.whl#sha256=43f456d40e4b70726874e01ce01fce32f50089ba98a2660292e9a6c63a06ebe9
 safehttpx==0.1.7
 scikit-learn==1.8.0
 scipy==1.16.3
@@ -134,9 +132,6 @@ six==1.17.0
 smart_open==7.5.0
 sniffio==1.3.1
 soupsieve==2.8.1
-spacy==3.8.11
-spacy-legacy==3.0.12
-spacy-loggers==1.0.5
 srsly==2.5.2
 stack-data==0.6.3
 starlette==0.50.0
