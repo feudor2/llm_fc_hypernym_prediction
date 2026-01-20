@@ -359,6 +359,7 @@ async def process_prediction(text: str, max_iterations: int, temperature: float,
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_message},
     ]
+    logger.info(f'Starting messages: {pformat(messages)}')
     
     # Если есть стартовый узел, добавляем его в трекер
     if start_node_id:
@@ -393,6 +394,7 @@ async def process_prediction(text: str, max_iterations: int, temperature: float,
         
         response_message = response_obj.choices[0].message
         messages.append(response_message.model_dump())
+        logger.info(f'Iteration #{iteration_count}. Response message: {pformat(response_message.model_dump())}')
         
         # Check if this is the final response
         if not response_message.tool_calls:
@@ -430,6 +432,8 @@ async def process_prediction(text: str, max_iterations: int, temperature: float,
             })
         
         messages.extend(tool_messages)
+        logger.info(f'Iteration #{iteration_count}. Tool messages: {pformat(tool_messages)}')
+
     
     if final_result is None:
         final_result = "Достигнут лимит итераций"
@@ -472,6 +476,7 @@ async def process_prediction_stream(text: str, max_iterations: int, temperature:
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_message},
     ]
+    logger.info(f'Starting messages: {pformat(messages)}')
     
     # Фильтруем доступные инструменты согласно параметрам
     if set(functions) == {"get_hyponyms"}:
@@ -504,6 +509,8 @@ async def process_prediction_stream(text: str, max_iterations: int, temperature:
             yield f"data: {json.dumps({'type': 'thought', 'content': response_message.content.strip()}, ensure_ascii=False)}\n\n"
         
         messages.append(response_message.model_dump())
+        logger.info(f'Iteration #{i + 1}. Response message: {pformat(response_message.model_dump())}')
+
         
         # Check if this is the final response
         if not response_message.tool_calls:
@@ -567,6 +574,7 @@ async def process_prediction_stream(text: str, max_iterations: int, temperature:
             })
         
         messages.extend(tool_messages)
+        logger.info(f'Iteration #{i + 1}. Tool messages: {pformat(tool_messages)}')
         await asyncio.sleep(0.01)
     
     yield f"data: {json.dumps({'type': 'error', 'message': 'Достигнут лимит итераций'}, ensure_ascii=False)}\n\n"
