@@ -1,4 +1,8 @@
-wordnets
 __pycache__
-examples
 .env
+corpus
+wordnets
+examples
+datasets
+logs
+*_results
